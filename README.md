@@ -48,7 +48,7 @@ NEURAL_GRID uses [Qwen GGUF](https://huggingface.co/Qwen) models via `llama-cpp-
 
 NEURAL_GRID supports **any GGUF-compatible model** — not just Qwen. If your PC can run it, you can use it. Popular alternatives include Mistral, LLaMA, Phi, Gemma, and others available on [Hugging Face](https://huggingface.co/models?library=gguf).
 
-To swap in a custom model, open `neural_grid_usbv6.py` and find the `MODELS` dictionary near the top of the file:
+To swap in a custom model, open `neural_grid_usbv1.py` and find the `MODELS` dictionary near the top of the file:
 
 ```python
 MODELS = {
@@ -77,8 +77,8 @@ Replace the `file`, `path`, `ram_required`, and `description` fields for whichev
 
 ```
 USB Drive (e.g. E:\)
-├── neural_grid_usbv6.py     ← Main application
-├── neural_gridv6.bat        ← Launcher (double-click to run)
+├── neural_grid_usbv1.py     ← Main application
+├── neural_gridv1.bat        ← Launcher (double-click to run)
 ├── models\
 │   ├── Qwen2.5-3B-Q4_K_M.gguf
 │   ├── Qwen3-8B-Q4_K_M.gguf
@@ -106,7 +106,7 @@ pip install llama-cpp-python pywin32 psutil pyspellchecker
 Grab at least one Qwen GGUF model from Hugging Face and place it in the `models\` folder on your USB. The balanced 8B model is recommended for most use cases.
 
 ### 4. Launch
-Double-click `neural_gridv6.bat` — it auto-detects the drive letter, so it works on any PC regardless of what letter Windows assigns the USB.
+Double-click `neural_gridv1.bat` — it auto-detects the drive letter, so it works on any PC regardless of what letter Windows assigns the USB.
 
 ---
 
