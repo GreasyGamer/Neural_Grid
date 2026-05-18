@@ -330,8 +330,13 @@ def show_suggestions(suggestions, misspelled_word):
     
     hide_suggestions()
     
+    # Get the actual position of the input box relative to the root window
+    input_x = input_box.winfo_rootx() - root.winfo_rootx()
+    input_y = input_box.winfo_rooty() - root.winfo_rooty()
+    popup_height = 24 + (len(suggestions) * 28)  # Estimate height based on number of suggestions
+    
     suggestion_frame = tk.Frame(root, bg="#003300", bd=2, relief="solid")
-    suggestion_frame.place(x=50, y=root.winfo_height() - 125, width=300)
+    suggestion_frame.place(x=input_x, y=input_y - popup_height - 4, width=300)
     
     title = tk.Label(
         suggestion_frame,
