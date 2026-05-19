@@ -17,8 +17,8 @@ import win32com.client
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.0"
-BUILD_DATE = "2026"
+VERSION = "1.0.3"
+BUILD_DATE = "5-19-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
 # ────────────────────────────────────────────────
