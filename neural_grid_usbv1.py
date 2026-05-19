@@ -17,38 +17,31 @@ import win32com.client
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.0"
-BUILD_DATE = "2026"
+VERSION = "1.0.1"
+BUILD_DATE = "5-18-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
 # ────────────────────────────────────────────────
 # VOICE/TTS FUNCTIONS
 # ────────────────────────────────────────────────
 def speak_text(text):
-    """Speak text using Windows SAPI TTS"""
     if not voice_enabled or not tts_available or not tts_speaker:
         return
-    
     try:
-        # Stop any currently playing speech first to prevent overlap
         stop_speaking()
-        
-        # Clean text for better speech
-        clean_text = re.sub(r'[⚠📍🔧⚡📋✓✗←🔊🔇]', '', text)
-        clean_text = re.sub(r'\[.*?\]', '', clean_text)
-        clean_text = re.sub(r'─+', '', clean_text)
-        clean_text = re.sub(r'\n+', '. ', clean_text)
-        clean_text = clean_text.strip()
-        
+        clean_text = _TTS_EMOJI_RE.sub('', text)
+        clean_text = _TTS_TAG_RE.sub('', clean_text)
+        clean_text = _TTS_DASH_RE.sub('', clean_text)
+        clean_text = _TTS_NEWLINE_RE.sub('. ', clean_text).strip()
         if DEBUG:
             print(f"[DEBUG] Speaking: '{clean_text[:100]}'")
-        
         if clean_text and len(clean_text) > 3:
             tts_speaker.Speak(clean_text)
             if DEBUG:
                 print("[DEBUG] Speech completed")
     except Exception as e:
-        print(f"[TTS Error] {e}")
+        if DEBUG:
+            print(f"[TTS Error] {e}")
 
 def stop_speaking():
     """Stop current TTS playback"""
@@ -72,6 +65,7 @@ MODELS = {
         "file": "Qwen2.5-3B-Q4_K_M.gguf",
         "path": os.path.join(MODELS_DIR, "Qwen2.5-3B-Q4_K_M.gguf"),
         "ram_required": 4,
+        "ctx": 8192,
         "description": "Fast & efficient - good for older/slower PCs"
     },
     "balanced": {
@@ -79,6 +73,7 @@ MODELS = {
         "file": "Qwen3-8B-Q4_K_M.gguf",
         "path": os.path.join(MODELS_DIR, "Qwen3-8B-Q4_K_M.gguf"),
         "ram_required": 6,
+        "ctx": 8192,
         "description": "Balanced speed & intelligence - recommended"
     },
     "deep": {
@@ -86,6 +81,7 @@ MODELS = {
         "file": "Qwen2.5-14B-Q4_K_M.gguf",
         "path": os.path.join(MODELS_DIR, "Qwen2.5-14B-Q4_K_M.gguf"),
         "ram_required": 10,
+        "ctx": 16384,
         "description": "Maximum intelligence - needs powerful PC"
     }
 }
@@ -99,18 +95,26 @@ current_model_tier = None
 current_mode = "normal"
 messages = []
 response_queue = Queue()
+is_generating = False
+stop_generation = False
 
 # Voice/TTS setup
 try:
     tts_speaker = win32com.client.Dispatch("SAPI.SpVoice")
-    tts_speaker.Rate = 1  # Speed: -10 (slow) to 10 (fast), 0 is default
-    tts_speaker.Volume = 100  # 0-100
+    tts_speaker.Rate = 1
+    tts_speaker.Volume = 100
     voice_enabled = False
     tts_available = True
-except:
+except Exception:
     tts_speaker = None
     voice_enabled = False
     tts_available = False
+
+# Pre-compiled regex for speak_text (compiled once, reused every call)
+_TTS_EMOJI_RE   = re.compile(r'[⚠📍🔧⚡📋✓✗←🔊🔇█░▓╔╗╚╝║═]')
+_TTS_TAG_RE     = re.compile(r'\[.*?\]')
+_TTS_DASH_RE    = re.compile(r'─+')
+_TTS_NEWLINE_RE = re.compile(r'\n+')
 
 # Spell checker
 spell = SpellChecker()
@@ -130,14 +134,18 @@ suggestion_frame = None
 # ────────────────────────────────────────────────
 def get_system_info():
     try:
-        ram_gb = psutil.virtual_memory().total / (1024**3)
+        mem = psutil.virtual_memory()
+        ram_gb = mem.total / (1024**3)
+        ram_used = mem.used / (1024**3)
+        ram_available = mem.available / (1024**3)
         cpu_count = multiprocessing.cpu_count()
-        return ram_gb, cpu_count
-    except:
-        return 8, 4
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        return ram_gb, cpu_count, ram_used, ram_available, cpu_percent
+    except Exception:
+        return 8, 4, 0, 8, 0
 
 def recommend_model():
-    ram_gb, cpu_count = get_system_info()
+    ram_gb, cpu_count, _, _, _ = get_system_info()
     
     if ram_gb >= 10:
         recommended = "deep"
@@ -232,16 +240,19 @@ def load_model_async(tier):
             update_status(f"[*] Unloading {MODELS[current_model_tier]['name']}...")
             del llm
             llm = None
+            import gc
+            gc.collect()
             time.sleep(1)
         
         model_loaded = False
         current_model_tier = tier
+        ctx_size = MODELS[tier].get("ctx", 8192)
         
         update_status(f"[*] Loading {MODELS[tier]['name']}... (30-90 sec)")
         
         llm = Llama(
             model_path=MODELS[tier]["path"],
-            n_ctx=8192,
+            n_ctx=ctx_size,
             n_threads=max(1, multiprocessing.cpu_count() - 1),
             n_gpu_layers=0,
             n_batch=512,
@@ -389,12 +400,13 @@ def replace_word(old_word, new_word):
 # ────────────────────────────────────────────────
 def save_chat_log():
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
         filename = f"chat_{current_mode}_{current_model_tier}_{timestamp}.json"
         filepath = os.path.join(CHAT_LOGS_DIR, filename)
         
         log_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now.isoformat(),
             "mode": current_mode,
             "model": MODELS[current_model_tier]["name"],
             "messages": messages
@@ -407,7 +419,7 @@ def save_chat_log():
         with open(txt_filepath, 'w', encoding='utf-8') as f:
             f.write(f"NEURAL_GRID Chat Log\n")
             f.write(f"Mode: {current_mode.upper()} | Model: {MODELS[current_model_tier]['name']}\n")
-            f.write(f"Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Saved: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 70 + "\n\n")
             
             for msg in messages:
@@ -509,6 +521,20 @@ Note: Switching models resets conversation"""
         else:
             return f"[ERROR] Save failed:\n{result}"
     
+    elif cmd == "sysinfo":
+        ram_gb, cpu_count, ram_used, ram_avail, cpu_pct = get_system_info()
+        return f"""╔══════════════════════════════════════════════════════════╗
+║                    SYSTEM STATUS                         ║
+╚══════════════════════════════════════════════════════════╝
+RAM Total:  {ram_gb:.1f} GB
+RAM Used:   {ram_used:.1f} GB
+RAM Free:   {ram_avail:.1f} GB
+CPU Cores:  {cpu_count}
+CPU Usage:  {cpu_pct:.1f}%
+USB Path:   {BASE_DIR}
+Models:     {MODELS_DIR}
+Logs:       {CHAT_LOGS_DIR}"""
+
     elif cmd == "version":
         ram_gb, cpu_count = get_system_info()
         model_name = MODELS[current_model_tier]["name"] if current_model_tier else "None"
@@ -562,6 +588,7 @@ UTILITIES:
 /clear          – Clear chat history
 /reset          – Reset conversation
 /save           – Save chat log
+/sysinfo        – Show RAM, CPU, and path info
 /version        – Show version & system info
 /help           – Show this list
 /quit or /exit  – Exit application
@@ -576,132 +603,166 @@ TIPS:
         return f"[ERROR] Unknown: /{cmd}\nType /help"
 
 # ────────────────────────────────────────────────
-# INFERENCE
+# INFERENCE (STREAMING)
 # ────────────────────────────────────────────────
 def run_inference(user_message):
-    global messages
-    
+    global messages, is_generating, stop_generation
+
+    is_generating = True
+    stop_generation = False
+
     messages.append({"role": "user", "content": user_message})
-    
-    if DEBUG:
-        print(f"[DEBUG] Messages before inference: {len(messages)}")
-    
+
     try:
-        output = llm.create_chat_completion(
+        full_response = ""
+        response_queue.put(("stream_start", ""))
+
+        for chunk in llm.create_chat_completion(
             messages,
             max_tokens=1024,
             temperature=0.7,
             top_p=0.9,
             top_k=40,
             repeat_penalty=1.15,
-            stop=["User:", "USER:", "\n\n\n"]
-        )
-        
-        raw_response = output["choices"][0]["message"]["content"].strip()
-        response = clean_response(raw_response)
-        messages.append({"role": "assistant", "content": response})
-        
-        if DEBUG:
-            print(f"[DEBUG] Messages after AI response: {len(messages)}")
+            stop=["User:", "USER:", "\n\n\n"],
+            stream=True
+        ):
+            if stop_generation:
+                break
+
+            delta = chunk["choices"][0].get("delta", {})
+            token = delta.get("content", "")
+            if token:
+                full_response += token
+                response_queue.put(("stream_token", token))
+
+        clean = clean_response(full_response)
+        messages.append({"role": "assistant", "content": clean})
         trim_context()
-        if DEBUG:
-            print(f"[DEBUG] Messages after trim: {len(messages)}")
-        
-        response_queue.put(("success", response))
-        
+        response_queue.put(("stream_end", clean))
+
     except Exception as e:
         response_queue.put(("error", f"[ERROR] {str(e)}"))
+    finally:
+        is_generating = False
 
 def check_response_queue():
+    from queue import Empty
     try:
-        status, data = response_queue.get_nowait()
-        
-        now = datetime.now().strftime("%H:%M")
-        chat_box.config(state=tk.NORMAL)
-        
-        if status == "success":
-            chat_box.insert(tk.END, f"[{now}] AI: ", "ai_tag")
-            chat_box.insert(tk.END, f"{data}\n", "ai_text")
-            
-            if voice_enabled:
-                if DEBUG:
-                    print(f"[DEBUG] Voice enabled, speaking response...")
-                threading.Thread(target=speak_text, args=(data,), daemon=True).start()
-        elif status == "system":
-            chat_box.insert(tk.END, f"{data}\n", "command_tag")
-        else:
-            chat_box.insert(tk.END, f"[{now}] ", "divider_tag")
-            chat_box.insert(tk.END, f"{data}\n", "command_tag")
-        
-        chat_box.insert(tk.END, "─" * 80 + "\n", "divider_tag")
-        chat_box.see(tk.END)
-        chat_box.config(state=tk.DISABLED)
-        
-        enable_input()
-        
-        # Update header after response is added to messages
-        update_header()
-        
-    except:
-        root.after(100, check_response_queue)
+        while True:
+            status, data = response_queue.get_nowait()
+
+            if status == "stream_start":
+                now = datetime.now().strftime("%H:%M")
+                chat_box.config(state=tk.NORMAL)
+                chat_box.insert(tk.END, f"[{now}] AI: ", "ai_tag")
+                chat_box.config(state=tk.DISABLED)
+
+            elif status == "stream_token":
+                chat_box.config(state=tk.NORMAL)
+                chat_box.insert(tk.END, data, "ai_text")
+                chat_box.see(tk.END)
+                chat_box.config(state=tk.DISABLED)
+
+            elif status == "stream_end":
+                chat_box.config(state=tk.NORMAL)
+                chat_box.insert(tk.END, "\n" + "─" * 80 + "\n", "divider_tag")
+                chat_box.see(tk.END)
+                chat_box.config(state=tk.DISABLED)
+                enable_input()
+                update_header()
+                if voice_enabled:
+                    threading.Thread(target=speak_text, args=(data,), daemon=True).start()
+                return
+
+            elif status == "system":
+                chat_box.config(state=tk.NORMAL)
+                chat_box.insert(tk.END, f"{data}\n", "command_tag")
+                chat_box.see(tk.END)
+                chat_box.config(state=tk.DISABLED)
+
+            elif status == "error":
+                now = datetime.now().strftime("%H:%M")
+                chat_box.config(state=tk.NORMAL)
+                chat_box.insert(tk.END, f"[{now}] ", "divider_tag")
+                chat_box.insert(tk.END, f"{data}\n", "command_tag")
+                chat_box.insert(tk.END, "─" * 80 + "\n", "divider_tag")
+                chat_box.see(tk.END)
+                chat_box.config(state=tk.DISABLED)
+                enable_input()
+                return
+
+    except Empty:
+        if is_generating:
+            root.after(30, check_response_queue)
 
 # ────────────────────────────────────────────────
 # UI INPUT
 # ────────────────────────────────────────────────
 def send_prompt(event=None):
+    global stop_generation
+
     if not model_loaded:
         return
-    
+
+    # If generating, treat Enter/Send as stop
+    if is_generating:
+        stop_generation = True
+        return
+
     hide_suggestions()
-    
+
     user_input = input_box.get().strip()
     if not user_input:
         return
-    
+
     input_box.delete(0, tk.END)
-    
+
     now = datetime.now().strftime("%H:%M")
     chat_box.config(state=tk.NORMAL)
-    
+
     chat_box.insert(tk.END, f"[{now}] > USER: ", "user_tag")
     chat_box.insert(tk.END, f"{user_input}\n", "user_text")
     chat_box.see(tk.END)
-    
+
     if user_input.startswith("/"):
         command_text = user_input[1:].strip()
         response = handle_command(command_text)
-        
+
         if response:
             chat_box.insert(tk.END, f"[{now}] ", "divider_tag")
             chat_box.insert(tk.END, f"{response}\n", "command_tag")
             chat_box.insert(tk.END, "─" * 80 + "\n", "divider_tag")
             chat_box.see(tk.END)
-        
+
         chat_box.config(state=tk.DISABLED)
         return
-    
+
     chat_box.config(state=tk.DISABLED)
     disable_input()
-    
+
     threading.Thread(target=run_inference, args=(user_input,), daemon=True).start()
-    root.after(100, check_response_queue)
+    root.after(30, check_response_queue)
 
 def disable_input():
     input_box.config(state=tk.DISABLED, bg="#001100")
+    send_btn.config(text="■ STOP", bg="#330000", fg="#ff3333")
 
 def enable_input():
     input_box.config(state=tk.NORMAL, bg="#002200")
+    send_btn.config(text="SEND ▶", bg="#003300", fg="#00ff41")
     input_box.focus()
 
 # ────────────────────────────────────────────────
 # UI UPDATES
 # ────────────────────────────────────────────────
 def update_status(message):
-    chat_box.config(state=tk.NORMAL)
-    chat_box.insert(tk.END, f"{message}\n")
-    chat_box.see(tk.END)
-    chat_box.config(state=tk.DISABLED)
-    root.update()
+    def _update():
+        chat_box.config(state=tk.NORMAL)
+        chat_box.insert(tk.END, f"{message}\n")
+        chat_box.see(tk.END)
+        chat_box.config(state=tk.DISABLED)
+    root.after(0, _update)
 
 def update_header():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -760,14 +821,18 @@ def draw_scanlines():
     for i in range(0, h, 4):
         scanline.create_line(0, i, w, i, fill="#001100", width=1)
 
+_scanline_after_id = None
+
 def on_window_resize(event):
-    global last_window_size
+    global last_window_size, _scanline_after_id
     current_size = [root.winfo_width(), root.winfo_height()]
     if current_size != last_window_size:
         hide_suggestions()
         last_window_size = current_size
-        draw_scanlines()
         root.after(100, check_spelling)
+        if _scanline_after_id:
+            root.after_cancel(_scanline_after_id)
+        _scanline_after_id = root.after(150, draw_scanlines)
 
 root.bind("<Configure>", on_window_resize)
 
@@ -829,9 +894,36 @@ input_box = tk.Entry(
     highlightcolor="#00cc44",
     state=tk.DISABLED
 )
-input_box.pack(side=tk.LEFT, expand=True, fill=tk.X)
+input_box.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
 input_box.bind("<Return>", send_prompt)
 input_box.bind("<KeyRelease>", check_spelling)
+
+send_btn = tk.Button(
+    input_frame,
+    text="SEND ▶",
+    bg="#003300",
+    fg="#00ff41",
+    font=("Courier New", 10, "bold"),
+    relief="flat",
+    cursor="hand2",
+    width=10,
+    command=send_prompt
+)
+send_btn.pack(side=tk.LEFT)
+send_btn.bind("<Enter>", lambda e: send_btn.config(bg="#004400"))
+send_btn.bind("<Leave>", lambda e: send_btn.config(bg="#003300"))
+
+# Status bar at very bottom
+status_bar = tk.Label(
+    root,
+    text=f"USB: {BASE_DIR}  |  Models: {MODELS_DIR}  |  Logs: {CHAT_LOGS_DIR}  |  /help for commands",
+    bg="#001100",
+    fg="#005500",
+    font=("Courier New", 8),
+    anchor="w",
+    padx=10
+)
+status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
 # ────────────────────────────────────────────────
 # STARTUP
@@ -884,5 +976,5 @@ def startup_sequence():
     periodic_header_update()
     draw_scanlines()
 
-root.after(100, startup_sequence)
+root.after(500, startup_sequence)
 root.mainloop()
