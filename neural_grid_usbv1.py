@@ -7,7 +7,7 @@ import multiprocessing
 import re
 import time
 import threading
-from queue import Queue
+from queue import Queue, Empty
 from datetime import datetime
 import json
 import psutil
@@ -17,13 +17,20 @@ import win32com.client
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.2"
-BUILD_DATE = "5-18-2026"
+VERSION = "1.0.0"
+BUILD_DATE = "2026"
 DEBUG = False  # Set to True to enable debug output in console
 
 # ────────────────────────────────────────────────
 # VOICE/TTS FUNCTIONS
 # ────────────────────────────────────────────────
+def stop_speaking():
+    if tts_available and tts_speaker:
+        try:
+            tts_speaker.Speak("", 3)  # Flag 3 = PURGE + ASYNC to stop immediately
+        except Exception:
+            pass
+
 def speak_text(text):
     if not voice_enabled or not tts_available or not tts_speaker:
         return
@@ -42,15 +49,6 @@ def speak_text(text):
     except Exception as e:
         if DEBUG:
             print(f"[TTS Error] {e}")
-
-def stop_speaking():
-    """Stop current TTS playback"""
-    if tts_available and tts_speaker:
-        try:
-            # SPF_PURGEBEFORESPEAK (2) = stop current speech before starting new
-            tts_speaker.Speak("", 3)  # Flag 3 = PURGE + ASYNC to stop immediately
-        except:
-            pass
 
 # ────────────────────────────────────────────────
 # PATHS & CONFIGURATION
@@ -88,7 +86,177 @@ MODELS = {
 
 os.makedirs(CHAT_LOGS_DIR, exist_ok=True)
 
-# Global variables
+# ────────────────────────────────────────────────
+# THEMES
+# ────────────────────────────────────────────────
+THEMES = {
+    "green": {
+        "name": "MATRIX GREEN",
+        "bg":           "#000000",
+        "bg_dark":      "#0a0a0a",
+        "bg_header":    "#001100",
+        "bg_input":     "#002200",
+        "bg_input_dis": "#001100",
+        "bg_btn":       "#003300",
+        "bg_btn_hover": "#004400",
+        "bg_scanline":  "#001100",
+        "fg_main":      "#00ff41",
+        "fg_ai":        "#39ff14",
+        "fg_user":      "#00ffff",
+        "fg_user_text": "#ffff99",
+        "fg_command":   "#ff9933",
+        "fg_divider":   "#004400",
+        "fg_status":    "#005500",
+        "hl_border":    "#003300",
+        "hl_focus":     "#00aa33",
+        "hl_input":     "#00cc44",
+    },
+    "amber": {
+        "name": "AMBER TERMINAL",
+        "bg":           "#000000",
+        "bg_dark":      "#0a0800",
+        "bg_header":    "#110800",
+        "bg_input":     "#221100",
+        "bg_input_dis": "#110800",
+        "bg_btn":       "#332200",
+        "bg_btn_hover": "#443300",
+        "bg_scanline":  "#110800",
+        "fg_main":      "#ffb000",
+        "fg_ai":        "#ffd040",
+        "fg_user":      "#ff6600",
+        "fg_user_text": "#ffdd99",
+        "fg_command":   "#ff4400",
+        "fg_divider":   "#442200",
+        "fg_status":    "#553300",
+        "hl_border":    "#332200",
+        "hl_focus":     "#aa7000",
+        "hl_input":     "#cc8800",
+    },
+    "blue": {
+        "name": "ICE BLUE",
+        "bg":           "#000008",
+        "bg_dark":      "#00000f",
+        "bg_header":    "#000822",
+        "bg_input":     "#001133",
+        "bg_input_dis": "#000822",
+        "bg_btn":       "#001144",
+        "bg_btn_hover": "#002255",
+        "bg_scanline":  "#000822",
+        "fg_main":      "#00aaff",
+        "fg_ai":        "#40ccff",
+        "fg_user":      "#00ffff",
+        "fg_user_text": "#aaddff",
+        "fg_command":   "#ff6688",
+        "fg_divider":   "#002244",
+        "fg_status":    "#003355",
+        "hl_border":    "#001144",
+        "hl_focus":     "#0066aa",
+        "hl_input":     "#0088cc",
+    },
+    "red": {
+        "name": "DANGER RED",
+        "bg":           "#080000",
+        "bg_dark":      "#0f0000",
+        "bg_header":    "#220000",
+        "bg_input":     "#330000",
+        "bg_input_dis": "#220000",
+        "bg_btn":       "#440000",
+        "bg_btn_hover": "#550000",
+        "bg_scanline":  "#220000",
+        "fg_main":      "#ff2222",
+        "fg_ai":        "#ff5555",
+        "fg_user":      "#ff8800",
+        "fg_user_text": "#ffaa88",
+        "fg_command":   "#ffff00",
+        "fg_divider":   "#440000",
+        "fg_status":    "#550000",
+        "hl_border":    "#440000",
+        "hl_focus":     "#aa0000",
+        "hl_input":     "#cc0000",
+    },
+    "white": {
+        "name": "GHOST WHITE",
+        "bg":           "#0d0d0d",
+        "bg_dark":      "#111111",
+        "bg_header":    "#1a1a1a",
+        "bg_input":     "#222222",
+        "bg_input_dis": "#1a1a1a",
+        "bg_btn":       "#2a2a2a",
+        "bg_btn_hover": "#333333",
+        "bg_scanline":  "#1a1a1a",
+        "fg_main":      "#cccccc",
+        "fg_ai":        "#ffffff",
+        "fg_user":      "#88ccff",
+        "fg_user_text": "#dddddd",
+        "fg_command":   "#ffaa44",
+        "fg_divider":   "#333333",
+        "fg_status":    "#555555",
+        "hl_border":    "#333333",
+        "hl_focus":     "#888888",
+        "hl_input":     "#aaaaaa",
+    },
+}
+
+current_theme = "green"
+
+def apply_theme(theme_name):
+    global current_theme
+    if theme_name not in THEMES:
+        return False
+    t = THEMES[theme_name]
+    current_theme = theme_name
+
+    # Root and frames
+    root.configure(bg=t["bg_dark"])
+    input_frame.configure(bg=t["bg_dark"])
+    scanline.configure(bg=t["bg_dark"])
+
+    # Header and status bar
+    header.configure(bg=t["bg_header"], fg=t["fg_main"])
+    status_bar.configure(bg=t["bg_header"], fg=t["fg_status"])
+
+    # Chat box
+    chat_box.configure(
+        bg=t["bg"],
+        fg=t["fg_main"],
+        insertbackground=t["fg_main"],
+        highlightbackground=t["hl_border"],
+        highlightcolor=t["hl_focus"]
+    )
+    chat_box.tag_config("user_tag",    foreground=t["fg_user"])
+    chat_box.tag_config("user_text",   foreground=t["fg_user_text"])
+    chat_box.tag_config("ai_tag",      foreground=t["fg_main"])
+    chat_box.tag_config("ai_text",     foreground=t["fg_ai"])
+    chat_box.tag_config("command_tag", foreground=t["fg_command"])
+    chat_box.tag_config("divider_tag", foreground=t["fg_divider"])
+
+    # Input box
+    input_box.configure(
+        bg=t["bg_input"],
+        fg=t["fg_main"],
+        insertbackground=t["fg_main"],
+        highlightbackground=t["hl_border"],
+        highlightcolor=t["hl_input"]
+    )
+
+    # Prompt label
+    prompt_label.configure(bg=t["bg_dark"], fg=t["fg_main"])
+
+    # Send button
+    send_btn.configure(bg=t["bg_btn"], fg=t["fg_main"])
+    send_btn.bind("<Enter>", lambda e: send_btn.config(bg=t["bg_btn_hover"]) if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#440000"))
+    send_btn.bind("<Leave>", lambda e: send_btn.config(bg=t["bg_btn"]) if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#330000"))
+
+    # Redraw scanlines with new color
+    draw_scanlines_themed(t["bg_scanline"])
+    return True
+
+def draw_scanlines_themed(color):
+    scanline.delete("all")
+    h = root.winfo_height()
+    w = root.winfo_width()
+    for i in range(0, h, 4):
+        scanline.create_line(0, i, w, i, fill=color, width=1)
 llm = None
 model_loaded = False
 current_model_tier = None
@@ -467,7 +635,7 @@ def handle_command(cmd_text):
             return "[SYSTEM] 🔇 Voice mode OFF"
     
     elif cmd == "models":
-        ram_gb, cpu_count = get_system_info()
+        ram_gb, cpu_count, _, _, _ = get_system_info()
         info = f"""╔══════════════════════════════════════════════════════════╗
 ║                    AVAILABLE MODELS                      ║
 ╚══════════════════════════════════════════════════════════╝
@@ -521,6 +689,41 @@ Note: Switching models resets conversation"""
         else:
             return f"[ERROR] Save failed:\n{result}"
     
+    elif cmd == "pong":
+        def _launch_pong():
+            try:
+                pong_path = os.path.join(BASE_DIR, "neural_grid_pong.py")
+                if not os.path.exists(pong_path):
+                    response_queue.put(("system", "[ERROR] neural_grid_pong.py not found in NEURAL_GRID folder."))
+                    return
+                import subprocess
+                import sys
+                subprocess.Popen([sys.executable, pong_path])
+            except Exception as e:
+                response_queue.put(("system", f"[ERROR] Could not launch pong: {e}"))
+        threading.Thread(target=_launch_pong, daemon=True).start()
+        return "[SYSTEM] Launching PONG... get ready."
+
+    elif cmd == "theme" or cmd.startswith("theme "):
+        parts = cmd.split()
+        if len(parts) == 1:
+            theme_list = "\n".join([f"  /theme {k:<10} – {v['name']}" for k, v in THEMES.items()])
+            return f"""╔══════════════════════════════════════════════════════════╗
+║                    AVAILABLE THEMES                      ║
+╚══════════════════════════════════════════════════════════╝
+
+Current: {THEMES[current_theme]['name']}
+
+{theme_list}
+
+Usage: /theme <name>  e.g. /theme amber"""
+        theme_name = parts[1].lower()
+        if apply_theme(theme_name):
+            return f"[SYSTEM] Theme changed to {THEMES[theme_name]['name']}"
+        else:
+            valid = ", ".join(THEMES.keys())
+            return f"[ERROR] Unknown theme '{theme_name}'\nValid themes: {valid}"
+
     elif cmd == "sysinfo":
         ram_gb, cpu_count, ram_used, ram_avail, cpu_pct = get_system_info()
         return f"""╔══════════════════════════════════════════════════════════╗
@@ -559,14 +762,14 @@ Built with llama-cpp-python + Qwen GGUF models
 100% offline — no internet required"""
     
     elif cmd in ["quit", "exit", "stop"]:
-        chat_box.config(state=tk.NORMAL)
-        chat_box.insert(tk.END, "[SYSTEM] Shutting down...\n")
-        chat_box.see(tk.END)
-        chat_box.config(state=tk.DISABLED)
-        root.update()
-        time.sleep(0.8)
-        root.quit()
-        sys.exit(0)
+        def _shutdown():
+            chat_box.config(state=tk.NORMAL)
+            chat_box.insert(tk.END, "[SYSTEM] Shutting down...\n")
+            chat_box.see(tk.END)
+            chat_box.config(state=tk.DISABLED)
+            root.after(800, lambda: (root.quit(), sys.exit(0)))
+        root.after(0, _shutdown)
+        return ""
     
     elif cmd == "help":
         return """╔══════════════════════════════════════════════════════════╗
@@ -582,9 +785,11 @@ MODEL SELECTION:
 MODES:
 /survivalmode   – Wilderness survival & medical expert
 /normal         – Standard conversational mode
+/pong           – Play pong against GRID companion
 
 UTILITIES:
 /voice          – Toggle voice mode (AI speaks responses)
+/theme          – Change color theme (/theme for list)
 /clear          – Clear chat history
 /reset          – Reset conversation
 /save           – Save chat log
@@ -647,7 +852,6 @@ def run_inference(user_message):
         is_generating = False
 
 def check_response_queue():
-    from queue import Empty
     try:
         while True:
             status, data = response_queue.get_nowait()
@@ -815,11 +1019,12 @@ scanline = tk.Canvas(root, bg="#0a0a0a", highlightthickness=0)
 scanline.place(x=0, y=0, relwidth=1, relheight=1)
 
 def draw_scanlines():
+    t = THEMES[current_theme]
     scanline.delete("all")
     h = root.winfo_height()
     w = root.winfo_width()
     for i in range(0, h, 4):
-        scanline.create_line(0, i, w, i, fill="#001100", width=1)
+        scanline.create_line(0, i, w, i, fill=t["bg_scanline"], width=1)
 
 _scanline_after_id = None
 
@@ -910,8 +1115,8 @@ send_btn = tk.Button(
     command=send_prompt
 )
 send_btn.pack(side=tk.LEFT)
-send_btn.bind("<Enter>", lambda e: send_btn.config(bg="#004400"))
-send_btn.bind("<Leave>", lambda e: send_btn.config(bg="#003300"))
+send_btn.bind("<Enter>", lambda e: send_btn.config(bg="#004400") if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#440000"))
+send_btn.bind("<Leave>", lambda e: send_btn.config(bg="#003300") if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#330000"))
 
 # Status bar at very bottom
 status_bar = tk.Label(
