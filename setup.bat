@@ -127,12 +127,22 @@ if %errorlevel% neq 0 (
 
 echo.
 echo  +-----------------------------------------------------------+
-echo  ^|  STEP 4 - DOWNLOAD YOUR MODELS                            ^|
+echo  ^|  STEP 4 - CHECKING MODELS                                 ^|
 echo  +-----------------------------------------------------------+
 echo.
-echo  NEURAL_GRID uses GGUF models. Download at least one.
-echo  Place all .gguf files into:
-echo  %MODELS_DIR%
+
+:: Check if any .gguf files already exist in models folder
+set MODELS_FOUND=0
+for %%f in ("%MODELS_DIR%\*.gguf") do set MODELS_FOUND=1
+
+if "%MODELS_FOUND%"=="1" (
+    echo  [OK] Models found in %MODELS_DIR%
+    echo  [OK] Skipping model download step.
+    goto SETUP_COMPLETE
+)
+
+echo  No models found. You need at least one to run NEURAL_GRID.
+echo  Place .gguf files into: %MODELS_DIR%
 echo.
 echo  +-----------------------------------------------------------+
 echo  ^|  TIER      MODEL                        SIZE   RAM        ^|
@@ -168,6 +178,7 @@ if /i "%OPEN_LINKS%"=="y" (
     echo  [OK] Pages opened in browser
 )
 
+:SETUP_COMPLETE
 echo.
 echo  +-----------------------------------------------------------+
 echo  ^|  SETUP COMPLETE                                           ^|
@@ -175,13 +186,19 @@ echo  +-----------------------------------------------------------+
 echo.
 echo  Next steps:
 echo.
-echo    1. Download at least one model ^(Q4_K_M recommended^)
-echo       and place the .gguf file into:
-echo       %MODELS_DIR%
-echo.
-echo    2. Double-click launch.bat to start NEURAL_GRID
-echo.
-echo    3. Type /help inside the app to see all commands
+
+if "%MODELS_FOUND%"=="1" (
+    echo    1. Double-click NEURAL_GRID\launch.bat to start
+    echo    2. Type /help inside the app to see all commands
+) else (
+    echo    1. Download at least one model ^(Q4_K_M recommended^)
+    echo       and place the .gguf file into:
+    echo       %MODELS_DIR%
+    echo.
+    echo    2. Double-click NEURAL_GRID\launch.bat to start
+    echo    3. Type /help inside the app to see all commands
+)
+
 echo.
 echo  +-----------------------------------------------------------+
 echo  ^|  Plug in. Boot up. Stay offline.                         ^|
