@@ -25,12 +25,15 @@ Built with a cyberpunk terminal aesthetic and designed for portability, privacy,
 - **Portable** — runs entirely from a USB drive on any Windows PC
 - **Bring your own model** — ships with Qwen but works with any GGUF-compatible model
 - **Three model tiers** — auto-selects based on host machine RAM, swap models mid-session with a command
+- **Streaming responses** — AI output appears token by token, no waiting for full response
+- **Stop generation** — cancel a response mid-stream with the STOP button or Enter key
 - **Survival mode** — dedicated wilderness/emergency medical expert persona
 - **Voice output** — Windows SAPI TTS reads responses aloud (offline)
 - **Spell check** — live suggestions as you type
 - **Context memory** — tracks up to 24 messages with a visual memory bar
 - **Chat logging** — saves conversations as `.json` and `.txt`
-- **Cyberpunk UI** — green-on-black terminal aesthetic with scanline overlay
+- **Themes** — 5 built-in color themes, switch instantly with `/theme`
+- **GRID Pong** — play pong against your AI companion with live LLM banter, launch with `/pong`
 
 ---
 
@@ -48,7 +51,7 @@ NEURAL_GRID uses [Qwen GGUF](https://huggingface.co/Qwen) models via `llama-cpp-
 
 NEURAL_GRID supports **any GGUF-compatible model** — not just Qwen. If your PC can run it, you can use it. Popular alternatives include Mistral, LLaMA, Phi, Gemma, and others available on [Hugging Face](https://huggingface.co/models?library=gguf).
 
-To swap in a custom model, open `neural_grid_usbv1.py` and find the `MODELS` dictionary near the top of the file:
+To swap in a custom model, open `neural_grid_usbv6.py` and find the `MODELS` dictionary near the top of the file:
 
 ```python
 MODELS = {
@@ -77,36 +80,72 @@ Replace the `file`, `path`, `ram_required`, and `description` fields for whichev
 
 ```
 USB Drive (e.g. E:\)
-├── neural_grid_usbv1.py     ← Main application
-├── neural_gridv1.bat        ← Launcher (double-click to run)
-├── models\
-│   ├── Qwen2.5-3B-Q4_K_M.gguf
-│   ├── Qwen3-8B-Q4_K_M.gguf
-│   └── Qwen2.5-14B-Q4_K_M.gguf
-├── chatlogs\                ← Auto-created on first save
-└── WinPython\               ← Portable Python runtime
-    └── WPy64-31241\
-        └── python-3.12.4.amd64\
+├── setup.bat                    ← Run this first
+└── NEURAL_GRID\
+    ├── launch.bat               ← Launch NEURAL_GRID (double-click to run)
+    ├── neural_grid_usbv6.py     ← Main application
+    ├── neural_grid_pong.py      ← Pong companion game (launched via /pong)
+    ├── requirements.txt         ← Dependency list
+    ├── models\                  ← Place your .gguf model files here
+    │   ├── Qwen2.5-3B-Q4_K_M.gguf
+    │   ├── Qwen3-8B-Q4_K_M.gguf
+    │   └── Qwen2.5-14B-Q4_K_M.gguf
+    ├── chatlogs\                ← Chat logs saved here
+    └── WinPython\               ← Portable Python runtime
+        └── WPy64-31241\
+            └── python-3.12.4.amd64\
 ```
 
 ---
 
 ## Setup
 
-### 1. Get WinPython
-Download [WinPython 3.12](https://winpython.github.io/) and extract it to your USB drive at `\WinPython\`.
+### ⚡ Quick Setup (Recommended)
 
-### 2. Install dependencies
+1. Copy all files from this repo to your USB drive — keep `setup.bat` at the root and everything else inside a `NEURAL_GRID\` folder
+2. Download [WinPython 3.12](https://winpython.github.io/) and extract it into `NEURAL_GRID\WinPython\`
+3. Double-click `setup.bat` from the root of the USB
+4. The script will create your folder structure, install all dependencies, and give you direct download links for the models
+5. Download at least one model, place the `.gguf` file in `NEURAL_GRID\models\`
+6. Double-click `NEURAL_GRID\launch.bat` to start
+
+> `setup.bat` only needs to be run once. After that just use `launch.bat`.
+
+---
+
+### 🔧 Manual Setup (Advanced)
+
+If you prefer to set things up yourself:
+
+**1. Get WinPython**
+Download [WinPython 3.12](https://winpython.github.io/) and extract it to your USB at `NEURAL_GRID\WinPython\`.
+
+**2. Install dependencies**
 Open the WinPython command prompt and run:
 ```bash
 pip install llama-cpp-python pywin32 psutil pyspellchecker
 ```
 
-### 3. Download a model
-Grab at least one Qwen GGUF model from Hugging Face and place it in the `models\` folder on your USB. The balanced 8B model is recommended for most use cases.
+**3. Create folders**
+Inside `NEURAL_GRID\` create two folders manually:
+```
+NEURAL_GRID\models\
+NEURAL_GRID\chatlogs\
+```
 
-### 4. Launch
-Double-click `neural_gridv1.bat` — it auto-detects the drive letter, so it works on any PC regardless of what letter Windows assigns the USB.
+**4. Download a model**
+Grab at least one Qwen GGUF model from Hugging Face and place it in `NEURAL_GRID\models\`. The balanced 8B model is recommended for most use cases.
+
+| Model | Link |
+|-------|------|
+| Qwen2.5-3B (Fast) | [Hugging Face](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF) |
+| Qwen3-8B (Balanced) | [Hugging Face](https://huggingface.co/Qwen/Qwen3-8B-GGUF) |
+| Qwen2.5-14B (Deep) | [Hugging Face](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF) |
+
+Download the `Q4_K_M` version — best balance of quality and file size.
+
+**5. Launch**
+Double-click `NEURAL_GRID\launch.bat` — it auto-detects the drive letter so it works on any PC regardless of what letter Windows assigns the USB.
 
 ---
 
@@ -118,12 +157,16 @@ Double-click `neural_gridv1.bat` — it auto-detects the drive letter, so it wor
 | `/balanced` | Switch to balanced 8B model |
 | `/deep` | Switch to deep 14B model |
 | `/models` | Show available models and system info |
+| `/pong` | Launch GRID Pong companion game |
 | `/survivalmode` | Activate wilderness/emergency medical expert |
 | `/normal` | Return to standard chat mode |
 | `/voice` | Toggle text-to-speech (offline, Windows SAPI) |
+| `/theme` | List available themes |
+| `/theme <name>` | Switch color theme (green/amber/blue/red/white) |
 | `/clear` | Clear chat window and reset context |
 | `/reset` | Reset conversation context |
 | `/save` | Save chat log to `chatlogs\` |
+| `/sysinfo` | Show RAM, CPU usage, and paths |
 | `/version` | Show version, model, system info |
 | `/help` | Show all commands |
 | `/quit` | Exit |
@@ -139,6 +182,33 @@ Recall: ▓▓▓▓▓░░░░░ (12/24)
 ```
 
 When memory fills up, the oldest messages are purged and the bar rolls back — the model keeps the most recent 16 exchanges and rebuilds from there.
+
+---
+
+## GRID Pong
+
+Type `/pong` inside NEURAL_GRID to launch a pong game against your AI companion GRID.
+
+GRID isn't just a scoreboard — the local LLM watches the game and generates friendly banter in real time based on what's happening. Every comment is freshly generated, so it never gets old.
+
+**Controls**
+
+| Key | Action |
+|-----|--------|
+| W / ↑ | Move paddle up |
+| S / ↓ | Move paddle down |
+| Space | Serve / restart |
+| Escape | Quit |
+
+**When GRID talks:**
+- Game start — a warm welcome
+- Every point scored — reacts based on who scored and the score gap
+- Long rallies — gets excited about the back and forth
+- Game over — celebrates your win or stays humble about theirs
+
+GRID is your companion out there, not your opponent. Friendly, funny, never mean. The banter generates on a background thread so the game never pauses — comments pop up naturally between points like a friend reacting from the sideline.
+
+If no model is found, the game still runs fine — GRID just stays quiet.
 
 ---
 
