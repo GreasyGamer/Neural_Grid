@@ -51,7 +51,7 @@ NEURAL_GRID uses [Qwen GGUF](https://huggingface.co/Qwen) models via `llama-cpp-
 
 NEURAL_GRID supports **any GGUF-compatible model** — not just Qwen. If your PC can run it, you can use it. Popular alternatives include Mistral, LLaMA, Phi, Gemma, and others available on [Hugging Face](https://huggingface.co/models?library=gguf).
 
-To swap in a custom model, open `neural_grid_usbv6.py` and find the `MODELS` dictionary near the top of the file:
+To swap in a custom model, open `neural_grid_usbv1.py` and find the `MODELS` dictionary near the top of the file:
 
 ```python
 MODELS = {
@@ -83,7 +83,7 @@ USB Drive (e.g. E:\)
 ├── setup.bat                    ← Run this first
 └── NEURAL_GRID\
     ├── launch.bat               ← Launch NEURAL_GRID (double-click to run)
-    ├── neural_grid_usbv6.py     ← Main application
+    ├── neural_grid_usbv1.py     ← Main application
     ├── neural_grid_pong.py      ← Pong companion game (launched via /pong)
     ├── requirements.txt         ← Dependency list
     ├── models\                  ← Place your .gguf model files here
