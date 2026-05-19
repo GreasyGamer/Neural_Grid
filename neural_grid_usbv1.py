@@ -17,7 +17,7 @@ import win32com.client
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 BUILD_DATE = "5-18-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
@@ -536,7 +536,7 @@ Models:     {MODELS_DIR}
 Logs:       {CHAT_LOGS_DIR}"""
 
     elif cmd == "version":
-        ram_gb, cpu_count = get_system_info()
+        ram_gb, cpu_count, ram_used, ram_avail, cpu_pct = get_system_info()
         model_name = MODELS[current_model_tier]["name"] if current_model_tier else "None"
         voice_status = "ON" if voice_enabled else "OFF"
         tts_status = "Available" if tts_available else "Not available"
