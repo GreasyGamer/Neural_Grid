@@ -246,6 +246,7 @@ class PongGame:
         self.ball_vx = BALL_SPEED * direction
         self.ball_vy = angle_y
         self.rally_count = 0
+        self.last_banter_event = ""  # Allow long_rally banter to fire each new point
 
     def draw_background(self):
         # Guard: only draw the static background once. If called again (e.g. on
@@ -520,7 +521,19 @@ class PongGame:
 def launch_pong():
     root = tk.Tk()
     root.configure(bg=BG)
+    # Center horizontally/vertically on screen. We set width but NOT height —
+    # the canvas is H px tall and two labels are packed below it, so letting Tk
+    # measure the full height with update_idletasks() avoids clipping those labels.
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    # Build the game first so Tk knows the real window height
     game = PongGame(root)
+    root.update_idletasks()
+    wh = root.winfo_reqheight()  # Actual height including canvas + labels
+    x = (sw - W) // 2
+    y = max(0, (sh - wh) // 2)
+    root.geometry(f"{W}x{wh}+{x}+{y}")
     root.mainloop()
 
 if __name__ == "__main__":
