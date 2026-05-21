@@ -68,6 +68,8 @@ MODELS = {
 
 Replace the `file`, `path`, `ram_required`, and `description` fields for whichever tier you want to swap. Drop the `.gguf` file into the `models\` folder on your USB and you're done. You can switch between loaded models mid-session using `/fast`, `/balanced`, or `/deep`.
 
+**Note on "thinking" models:** Some models (like Qwen3 and others built on reasoning architectures) output internal `<think>...</think>` blocks before their response. NEURAL_GRID filters these automatically for the built-in balanced tier, but if you swap in a third-party thinking model and see `<think>` tags appearing in the chat, that's why. Stick to non-thinking variants (usually labeled `instruct` rather than `thinking` or `reasoner`) if you want clean output without extra config.
+
 **Tips for picking a model:**
 - Q4_K_M quantization is the sweet spot — good quality, reasonable size
 - Check the model's RAM requirement before downloading — larger models need more
