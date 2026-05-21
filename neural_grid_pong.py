@@ -1,7 +1,6 @@
 import tkinter as tk
 import random
 import threading
-import time
 import os
 import sys
 
@@ -14,11 +13,13 @@ import sys
 def find_base_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    drive = os.path.splitdrive(os.path.abspath(__file__))[0] + "\\"
-    ng_dir = os.path.join(drive, "NEURAL_GRID")
+    # Walk up from the script's own directory looking for a NEURAL_GRID folder,
+    # so it works on Windows, Linux, and Mac without hardcoded separators.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ng_dir = os.path.join(os.path.splitdrive(script_dir)[0] + os.sep, "NEURAL_GRID")
     if os.path.exists(ng_dir):
         return ng_dir
-    return os.path.dirname(os.path.abspath(__file__))
+    return script_dir
 
 BASE_DIR   = find_base_dir()
 MODELS_DIR = os.path.join(BASE_DIR, "models")
@@ -47,7 +48,8 @@ PAD_W, PAD_H = 14, 80
 BALL_SIZE    = 12
 BALL_SPEED   = 5
 AI_SPEED     = 4
-AI_MISTAKE   = 0.18   # Chance AI misses on purpose (keeps it beatable)
+AI_MISTAKE   = 0.08   # Probability (0–1) AI skips a frame — makes it beatable
+MAX_BALL_SPEED = 12  # Cap to prevent tunneling through paddles at high rally counts
 SCORE_TO_WIN = 7
 
 # ── Colors (cyberpunk terminal palette) ──────────
@@ -68,10 +70,8 @@ BANTER_COLOR = "#ffff99"
 # ── LLM banter system ────────────────────────────
 llm          = None
 llm_loaded   = False
-banter_queue = []
 banter_lock  = threading.Lock()
 current_banter = ""
-banter_alpha   = 0.0   # For fade in/out effect
 
 SYSTEM_PROMPT = (
     "You are GRID, a fun AI companion playing pong with a friend. "
@@ -107,6 +107,7 @@ def load_llm_background():
             path = MODELS[tier]["path"]
             if os.path.exists(path) and ram_gb >= MODELS[tier]["ram_required"]:
                 chosen_path = path
+                break  # Stop at best viable tier
 
         # Fallback — just use any model that exists
         if not chosen_path:
@@ -134,7 +135,7 @@ def generate_banter(event_key, context=""):
     if not llm_loaded or llm is None:
         return
     def _gen():
-        global current_banter, banter_alpha
+        global current_banter
         if not llm_loaded or llm is None:
             return
         try:
@@ -152,11 +153,9 @@ def generate_banter(event_key, context=""):
                 repeat_penalty=1.1,
             )
             text = output["choices"][0]["message"]["content"].strip()
-            # Remove quotes if model wraps in them
             text = text.strip('"').strip("'")
             with banter_lock:
                 current_banter = f"GRID: {text}"
-                banter_alpha = 1.0
         except Exception:
             pass
     threading.Thread(target=_gen, daemon=True).start()
@@ -215,24 +214,28 @@ class PongGame:
         self.state       = "waiting"   # waiting / playing / scored / gameover
         self.rally_count = 0
         self.last_banter_event = ""
+        self._cached_banter = ""       # Banter snapshot refreshed once per second
+        self._banter_tick   = 0        # Frame counter for throttling banter reads
 
         self.show_start_screen()
         self.game_loop()
 
     def load_model(self):
-        self.status_var.set("Loading GRID companion...")
         load_llm_background()
         if llm_loaded:
-            self.status_var.set("GRID is online — Press SPACE to play")
-            generate_banter("game_start")
+            self.root.after(0, lambda: self.status_var.set("GRID is online — Press SPACE to play"))
+            self.root.after(0, lambda: generate_banter("game_start"))
         else:
-            self.status_var.set("GRID offline (no model found) — Press SPACE to play")
+            self.root.after(0, lambda: self.status_var.set("GRID offline (no model found) — Press SPACE to play"))
 
     def reset_game(self):
         self.player_y  = H // 2 - PAD_H // 2
         self.ai_y      = H // 2 - PAD_H // 2
         self.player_score = 0
         self.ai_score     = 0
+        self.last_banter_event = ""
+        self._cached_banter = ""
+        self._banter_tick   = 0
         self.reset_ball()
 
     def reset_ball(self):
@@ -245,14 +248,22 @@ class PongGame:
         self.rally_count = 0
 
     def draw_background(self):
+        # Guard: only draw the static background once. If called again (e.g. on
+        # a future resize hook), don't pile up duplicate permanent canvas items.
+        if getattr(self, '_background_drawn', False):
+            return
+        self._background_drawn = True
         # Grid lines
         for x in range(0, W, 60):
             self.canvas.create_line(x, 0, x, H, fill=GRID_COLOR, width=1)
         for y in range(0, H, 60):
             self.canvas.create_line(0, y, W, y, fill=GRID_COLOR, width=1)
-        # Scanlines
+        # Scanlines via PhotoImage tile — much faster than hundreds of line objects
+        tile = tk.PhotoImage(width=1, height=4)
+        tile.put(SCANLINE, to=(0, 0, 1, 1))
         for y in range(0, H, 4):
-            self.canvas.create_line(0, y, W, y, fill=SCANLINE, width=1, tags="scanline")
+            self.canvas.create_image(0, y, image=tile, anchor="nw", tags="scanline")
+        self.canvas._scanline_tile = tile  # Keep reference to prevent GC
         # Net
         for y in range(0, H, 20):
             self.canvas.create_rectangle(W//2 - 2, y, W//2 + 2, y + 10,
@@ -331,8 +342,7 @@ class PongGame:
                 self.ball_y + BALL_SIZE >= self.player_y and
                 self.ball_y <= self.player_y + PAD_H and
                 self.ball_vx < 0):
-            self.ball_vx *= -1
-            # Add angle based on hit position
+            self.ball_vx = min(MAX_BALL_SPEED, abs(self.ball_vx) + 0.3) 
             hit_pos = (self.ball_y - self.player_y) / PAD_H
             self.ball_vy = (hit_pos - 0.5) * 8
             self.rally_count += 1
@@ -344,7 +354,7 @@ class PongGame:
                 self.ball_y + BALL_SIZE >= self.ai_y and
                 self.ball_y <= self.ai_y + PAD_H and
                 self.ball_vx > 0):
-            self.ball_vx *= -1
+            self.ball_vx = -min(MAX_BALL_SPEED, abs(self.ball_vx) + 0.3)
             hit_pos = (self.ball_y - self.ai_y) / PAD_H
             self.ball_vy = (hit_pos - 0.5) * 8
             self.rally_count += 1
@@ -370,7 +380,25 @@ class PongGame:
         diff = abs(ps - ai)
         score_ctx = f"Current score: you {ai} — friend {ps}."
 
-        if scorer == "player":
+        # Check game-over first so we fire exactly one banter event per point.
+        # Previously the code fired a point-banter AND a gameover-banter in the
+        # same call, launching two concurrent LLM threads that raced to write
+        # current_banter — the slower one would silently overwrite the faster one.
+        if ps >= SCORE_TO_WIN:
+            self.state = "gameover"
+            self.show_gameover("PLAYER")
+            generate_banter("player_wins", f"Final score: you {ai} — friend {ps}.")
+            return
+        if ai >= SCORE_TO_WIN:
+            self.state = "gameover"
+            self.show_gameover("GRID")
+            generate_banter("ai_wins", f"Final score: you {ai} — friend {ps}.")
+            return
+
+        # Only fire one banter event per point — close_game takes priority when tense
+        if diff <= 1 and ps + ai > 4 and random.random() < 0.4:
+            generate_banter("close_game", score_ctx)
+        elif scorer == "player":
             if ps > ai and diff >= 2:
                 generate_banter("player_winning", score_ctx)
             else:
@@ -381,21 +409,8 @@ class PongGame:
             else:
                 generate_banter("ai_scores", score_ctx)
 
-        if diff <= 1 and ps + ai > 4:
-            if random.random() < 0.4:
-                generate_banter("close_game", score_ctx)
-
-        if ps >= SCORE_TO_WIN:
-            self.state = "gameover"
-            self.show_gameover("PLAYER")
-            generate_banter("player_wins", f"Final score: you {ai} — friend {ps}.")
-        elif ai >= SCORE_TO_WIN:
-            self.state = "gameover"
-            self.show_gameover("GRID")
-            generate_banter("ai_wins", f"Final score: you {ai} — friend {ps}.")
-
     def check_rally_banter(self):
-        if self.rally_count == 8 and self.last_banter_event != "long_rally":
+        if self.rally_count >= 8 and self.last_banter_event != "long_rally":
             self.last_banter_event = "long_rally"
             generate_banter("long_rally")
 
@@ -484,11 +499,14 @@ class PongGame:
                 text="[ SPACE ] to serve",
                 font=("Courier New", 13), fill=TEXT_ORANGE, tags="game")
 
-        # Update banter
-        with banter_lock:
-            banter = current_banter
-        if banter:
-            self.banter_var.set(banter)
+        # Refresh banter snapshot once per second (~60 frames) instead of every frame
+        self._banter_tick += 1
+        if self._banter_tick >= 60:
+            self._banter_tick = 0
+            with banter_lock:
+                self._cached_banter = current_banter
+        if self._cached_banter:
+            self.banter_var.set(self._cached_banter)
 
     def game_loop(self):
         if self.state == "playing":
