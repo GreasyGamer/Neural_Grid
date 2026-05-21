@@ -25,7 +25,7 @@ except ImportError:
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 BUILD_DATE = "5-21-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
@@ -883,14 +883,23 @@ def run_inference(user_message):
         _is_generating.clear()
         return
 
+    # Store the clean message in history so logs stay readable.
+    # Only pass /no_think to the model for Qwen3 (balanced) to suppress think blocks.
     messages.append({"role": "user", "content": user_message})
+    if current_model_tier == "balanced":
+        inference_messages = messages[:-1] + [{"role": "user", "content": "/no_think " + user_message}]
+    else:
+        inference_messages = messages
 
     try:
         full_response = ""
+        in_think_block = False
+        think_done = False   # Once </think> seen, never suppress again
+        trim_next = False    # Strip leading whitespace from first token(s) after </think>
         response_queue.put(("stream_start", ""))
 
         for chunk in llm.create_chat_completion(
-            messages,
+            inference_messages,
             max_tokens=1024,
             temperature=0.7,
             top_p=0.9,
@@ -904,9 +913,30 @@ def run_inference(user_message):
 
             delta = chunk["choices"][0].get("delta", {})
             token = delta.get("content", "")
-            if token:
-                full_response += token
-                response_queue.put(("stream_token", token))
+            if not token:
+                continue
+
+            full_response += token
+
+            # Suppress think block tokens from the live UI stream
+            if not think_done:
+                if not in_think_block and "<think>" in full_response:
+                    in_think_block = True
+                if in_think_block:
+                    if "</think>" in full_response:
+                        in_think_block = False
+                        think_done = True
+                        trim_next = True
+                    continue  # Inside (or just closed) think block — suppress this token
+
+            # Strip leading whitespace from the first token(s) after </think>
+            if trim_next:
+                token = token.lstrip()
+                if not token:
+                    continue  # Pure whitespace token — skip it
+                trim_next = False
+
+            response_queue.put(("stream_token", token))
 
         clean = clean_response(full_response)
         messages.append({"role": "assistant", "content": clean})
