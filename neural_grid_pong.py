@@ -70,8 +70,12 @@ BANTER_COLOR = "#ffff99"
 # ── LLM banter system ────────────────────────────
 llm          = None
 llm_loaded   = False
-banter_lock  = threading.Lock()
+banter_lock      = threading.Lock()   # Protects current_banter and banter_history
+banter_gate      = threading.Lock()   # Used to atomically check-and-set banter_generating
+banter_generating = threading.Event()  # Set while LLM is running — prevents concurrent calls
 current_banter = ""
+banter_history = []  # Rolling history of recent banter to avoid repetition
+MAX_BANTER_HISTORY = 6
 
 SYSTEM_PROMPT = (
     "You are GRID, a fun AI companion playing pong with a friend. "
@@ -80,8 +84,19 @@ SYSTEM_PROMPT = (
     "Never be genuinely mean. Keep it to ONE short punchy sentence. No quotes around your response."
 )
 
+GAME_START_OPENERS = [
+    "The pong game is starting. Welcome your friend with something energetic.",
+    "The pong game is starting. Say something cocky but friendly to open.",
+    "The pong game is starting. Make a joke about being an AI playing pong.",
+    "The pong game is starting. Say something mysterious and dramatic to open.",
+    "The pong game is starting. Give a quick trash-talk opener, keep it playful.",
+    "The pong game is starting. Say something warm and excited to kick things off.",
+    "The pong game is starting. Reference being out in the wilderness together somehow.",
+    "The pong game is starting. Open with a weird fun fact or observation.",
+]
+
 EVENTS = {
-    "game_start":      "The pong game is starting. Say something fun to your friend to kick things off.",
+    "game_start":      "",  # Randomly selected at call time
     "player_scores":   "Your friend just scored against you. The score is noted below. React accordingly.",
     "ai_scores":       "YOU just scored against your friend. The score is noted below. If you are winning say something lightly competitive. If it is close just be playful.",
     "player_winning":  "Your friend is winning. The score is noted below. Be encouraging but maybe a little competitive about catching up.",
@@ -134,30 +149,51 @@ def load_llm_background():
 def generate_banter(event_key, context=""):
     if not llm_loaded or llm is None:
         return
+    # Use a dedicated gate lock to atomically check-and-set banter_generating
+    if not banter_gate.acquire(blocking=False):
+        return  # Another thread is already at the gate
+    already_running = banter_generating.is_set()
+    banter_generating.set()
+    banter_gate.release()
+    if already_running:
+        return  # LLM already running — drop this request
     def _gen():
-        global current_banter
+        global current_banter, banter_history
         if not llm_loaded or llm is None:
+            banter_generating.clear()
             return
         try:
-            base_prompt = EVENTS.get(event_key, "Something interesting just happened in the game. React briefly.")
+            if event_key == "game_start":
+                base_prompt = random.choice(GAME_START_OPENERS)
+            else:
+                base_prompt = EVENTS.get(event_key, "Something interesting just happened in the game. React briefly.")
             prompt = f"{base_prompt}{(' ' + context) if context else ''}"
+            # Build messages with rolling history so the model doesn't repeat itself
+            with banter_lock:
+                history_snapshot = list(banter_history)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            for past in history_snapshot:
+                messages.append({"role": "assistant", "content": past})
+            messages.append({"role": "user", "content": prompt})
             output = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": prompt}
-                ],
+                messages=messages,
                 max_tokens=60,
                 temperature=0.92,
                 top_p=0.9,
                 top_k=40,
-                repeat_penalty=1.1,
+                repeat_penalty=1.3,
             )
             text = output["choices"][0]["message"]["content"].strip()
             text = text.strip('"').strip("'")
             with banter_lock:
+                banter_history.append(text)
+                if len(banter_history) > MAX_BANTER_HISTORY:
+                    banter_history.pop(0)
                 current_banter = f"GRID: {text}"
         except Exception:
             pass
+        finally:
+            banter_generating.clear()
     threading.Thread(target=_gen, daemon=True).start()
 
 # ── Main game class ───────────────────────────────
@@ -181,7 +217,8 @@ class PongGame:
             fg=BANTER_COLOR,
             font=("Courier New", 11, "italic"),
             wraplength=860,
-            justify="center"
+            justify="center",
+            height=2  # Fixed height — prevents long responses from pushing status label off screen
         )
         self.banter_label.pack(pady=(0, 6))
 
@@ -229,6 +266,7 @@ class PongGame:
             self.root.after(0, lambda: self.status_var.set("GRID offline (no model found) — Press SPACE to play"))
 
     def reset_game(self):
+        global banter_history, current_banter
         self.player_y  = H // 2 - PAD_H // 2
         self.ai_y      = H // 2 - PAD_H // 2
         self.player_score = 0
@@ -236,6 +274,8 @@ class PongGame:
         self.last_banter_event = ""
         self._cached_banter = ""
         self._banter_tick   = 0
+        banter_history = []  # Reset history each new game
+        current_banter = ""
         self.reset_ball()
 
     def reset_ball(self):
@@ -506,7 +546,8 @@ class PongGame:
             self._banter_tick = 0
             with banter_lock:
                 self._cached_banter = current_banter
-        if self._cached_banter:
+        if self._cached_banter and self._cached_banter != self.banter_var.get():
+            self.banter_var.set("")  # Clear first to force label resize
             self.banter_var.set(self._cached_banter)
 
     def game_loop(self):
