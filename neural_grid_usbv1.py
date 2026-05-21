@@ -25,7 +25,7 @@ except ImportError:
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 BUILD_DATE = "5-21-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
@@ -310,8 +310,10 @@ current_mode = "normal"
 messages = []
 llm = None  # Global LLM instance; declared here so load_model_async can reference it
 response_queue = Queue()
-is_generating = False
-stop_generation = False
+# Use threading.Event instead of bare booleans — gives correct cross-thread
+# visibility without relying on CPython GIL behaviour.
+_is_generating  = threading.Event()   # set = generating, clear = idle
+_stop_generation = threading.Event()  # set = stop requested
 
 # Spell checker
 spell = SpellChecker()
@@ -600,6 +602,7 @@ def hide_suggestions():
         suggestion_frame = None
 
 def replace_word(old_word, new_word):
+    global _last_spell_text
     text = input_box.get()
     words = text.split()
     
@@ -608,8 +611,12 @@ def replace_word(old_word, new_word):
             words[i] = new_word
             break
     
+    new_text = " ".join(words) + " "
     input_box.delete(0, tk.END)
-    input_box.insert(0, " ".join(words) + " ")
+    input_box.insert(0, new_text)
+    # Reset cache so the next KeyRelease sees the corrected text as "new"
+    # and re-evaluates it rather than skipping due to a stale match.
+    _last_spell_text = new_text.strip()
     input_box.focus()
     hide_suggestions()
 
@@ -863,17 +870,17 @@ TIPS:
 # INFERENCE (STREAMING)
 # ────────────────────────────────────────────────
 def run_inference(user_message):
-    global messages, is_generating, stop_generation
+    global messages
 
-    is_generating = True
-    stop_generation = False
+    _is_generating.set()
+    _stop_generation.clear()
 
     # Guard against race condition: if model was unloaded between send_prompt's
     # model_loaded check and this thread starting, bail out cleanly without
     # corrupting the message history.
     if llm is None:
         response_queue.put(("error", "[ERROR] Model not ready. Please wait for loading to complete."))
-        is_generating = False
+        _is_generating.clear()
         return
 
     messages.append({"role": "user", "content": user_message})
@@ -892,7 +899,7 @@ def run_inference(user_message):
             stop=["User:", "USER:", "\n\n\n"],
             stream=True
         ):
-            if stop_generation:
+            if _stop_generation.is_set():
                 break
 
             delta = chunk["choices"][0].get("delta", {})
@@ -914,7 +921,7 @@ def run_inference(user_message):
             messages.pop()
         response_queue.put(("error", f"[ERROR] {str(e)}"))
     finally:
-        is_generating = False
+        _is_generating.clear()
 
 def check_response_queue():
     input_reenabled = False
@@ -970,9 +977,9 @@ def check_response_queue():
                 # Don't return — drain any remaining queued messages
 
     except Empty:
-        # BUG FIX: always re-schedule if generating; also do a final drain pass
-        # once is_generating flips False so late-arriving tokens are never lost.
-        if is_generating:
+        # Always re-schedule if generating; also do a final drain pass
+        # once _is_generating clears so late-arriving tokens are never lost.
+        if _is_generating.is_set():
             root.after(30, check_response_queue)
         elif not input_reenabled:
             # Generation finished between the last reschedule and now — re-enable input
@@ -983,14 +990,12 @@ def check_response_queue():
 # UI INPUT
 # ────────────────────────────────────────────────
 def send_prompt(event=None):
-    global stop_generation
-
     if not model_loaded:
         return
 
     # If generating, treat Enter/Send as stop
-    if is_generating:
-        stop_generation = True
+    if _is_generating.is_set():
+        _stop_generation.set()
         return
 
     hide_suggestions()
@@ -1267,7 +1272,8 @@ def startup_sequence():
     
     threading.Thread(target=load_model_async, args=(recommended_tier,), daemon=True).start()
     
-    update_header()
+    # periodic_header_update() calls update_header() immediately then reschedules
+    # itself every 60 s — no need for a separate update_header() call here.
     periodic_header_update()
     draw_scanlines()
 
