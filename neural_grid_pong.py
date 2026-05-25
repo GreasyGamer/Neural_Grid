@@ -1,6 +1,7 @@
 import tkinter as tk
 import random
-import threading
+import multiprocessing
+import queue
 import os
 import sys
 
@@ -49,10 +50,28 @@ BALL_SIZE    = 12
 BALL_SPEED   = 5
 AI_SPEED     = 4
 AI_MISTAKE   = 0.08   # Probability (0–1) AI skips a frame — makes it beatable
-MAX_BALL_SPEED = 12  # Cap to prevent tunneling through paddles at high rally counts
+PLAYER_SPEED = 7       # Pixels per frame the player paddle moves when a key is held
 SCORE_TO_WIN = 7
 
-# ── Colors (cyberpunk terminal palette) ──────────
+# ── Difficulty presets ────────────────────────────
+DIFFICULTIES = {
+    "BRAINDEAD": {"ai_speed": 2,   "ai_mistake": 0.35, "label": "BRAINDEAD"},
+    "EASY":      {"ai_speed": 3,   "ai_mistake": 0.18, "label": "EASY"},
+    "NORMAL":    {"ai_speed": 4,   "ai_mistake": 0.08, "label": "NORMAL"},
+    "HARD":      {"ai_speed": 5,   "ai_mistake": 0.03, "label": "HARD"},
+    "NIGHTMARE": {"ai_speed": 7,   "ai_mistake": 0.00, "label": "NIGHTMARE"},
+}
+DEFAULT_DIFFICULTY = "NORMAL"
+
+# ── Ball speed presets ────────────────────────────
+BALL_SPEEDS = {
+    "SLOW":   5,
+    "NORMAL": 8,
+    "FAST":   12,
+    "INSANE": 18,
+}
+DEFAULT_BALL_SPEED = "NORMAL"
+MAX_BALL_SPEED = 22   # Hard cap so rally speed-up can't go infinite
 BG          = "#000000"
 SCANLINE    = "#0a0a0a"
 GRID_COLOR  = "#071407"
@@ -67,14 +86,156 @@ TEXT_CYAN   = "#00ffff"
 TEXT_ORANGE = "#ff9933"
 BANTER_COLOR = "#ffff99"
 
-# ── LLM banter system ────────────────────────────
-llm          = None
-llm_loaded   = False
-banter_lock      = threading.Lock()   # Protects current_banter and banter_history
-banter_gate      = threading.Lock()   # Used to atomically check-and-set banter_generating
-banter_generating = threading.Event()  # Set while LLM is running — prevents concurrent calls
-current_banter = ""
-banter_history = []  # Rolling history of recent banter to avoid repetition
+# ── Pong Avatar ──────────────────────────────────
+class PongAvatar:
+    """ASCII avatar for GRID — reacts to game events with distinct expressions.
+    Designed to feel like a character, not just a status indicator."""
+
+    # (face, arms) raw string pairs — backslashes are literal
+    STATES = {
+        "idle": [
+            (r"( -_- )", r" |   | "),
+            (r"( -_- )", r" |   | "),
+            (r"( -_- )", r" |   | "),
+            (r"( ._. )", r" |   | "),
+        ],
+        "waiting": [
+            (r"( o_o )", r" |   | "),
+            (r"( o_- )", r" |   | "),
+            (r"( o_o )", r" |   | "),
+            (r"( -_o )", r" |   | "),
+        ],
+        "playing": [
+            (r"( >_< )", r" /   \ "),
+            (r"( >_> )", r" |   \ "),
+            (r"( <_< )", r" /   | "),
+            (r"( >_< )", r" /   \ "),
+        ],
+        "ball_coming": [
+            (r"( O_O )", r" /   \ "),
+            (r"( O_o )", r" /   | "),
+            (r"( O_O )", r" \   / "),
+            (r"( o_O )", r" |   / "),
+        ],
+        "scored_ai": [
+            (r"( ^_^ )", r"o/     "),
+            (r"( ^_^ )", r" /     "),
+            (r"( ^_^ )", r"o/     "),
+            (r"( ^_^ )", r" |   | "),
+        ],
+        "scored_player": [
+            (r"( T_T )", r" \   / "),
+            (r"( ;_; )", r" |   | "),
+            (r"( T_T )", r" \   / "),
+            (r"( ._. )", r" |   | "),
+        ],
+        "long_rally": [
+            (r"( @_@ )", r" /   \ "),
+            (r"( O_O )", r" \   / "),
+            (r"( @_@ )", r" /   \ "),
+            (r"( o_o )", r" |   | "),
+        ],
+        "ai_wins": [
+            (r"( ^o^ )", r"o/     "),
+            (r"( ^o^ )", r" /     "),
+            (r"( ^o^ )", r"o/     "),
+            (r"( ^o^ )", r" \   / "),
+        ],
+        "player_wins": [
+            (r"( x_x )", r" |   | "),
+            (r"( -_- )", r" |   | "),
+            (r"( x_x )", r" \   / "),
+            (r"( ._. )", r" |   | "),
+        ],
+    }
+
+    INTERVALS = {
+        "idle":           900,
+        "waiting":        700,
+        "playing":        220,
+        "ball_coming":    180,
+        "scored_ai":      250,
+        "scored_player":  400,
+        "long_rally":     200,
+        "ai_wins":        220,
+        "player_wins":    500,
+    }
+
+    ONE_SHOT = {"scored_ai", "scored_player", "ai_wins", "player_wins", "long_rally"}
+
+    def __init__(self, parent):
+        self._state     = "waiting"
+        self._frame_idx = 0
+        self._after_id  = None
+        self._parent    = parent
+        self._revert_to = "waiting"
+
+        self._frame = tk.Frame(parent, bg=BG)
+
+        self._face_label = tk.Label(
+            self._frame,
+            text="",
+            font=("Courier New", 10, "bold"),
+            bg=BG,
+            fg=PAD_AI,
+            anchor="center",
+            width=10,
+        )
+        self._face_label.pack()
+
+        self._arms_label = tk.Label(
+            self._frame,
+            text="",
+            font=("Courier New", 9),
+            bg=BG,
+            fg=PAD_AI,
+            anchor="center",
+            width=10,
+        )
+        self._arms_label.pack()
+
+        self._animate()
+
+    def pack(self, **kwargs):
+        self._frame.pack(**kwargs)
+
+    def set_state(self, state, revert_to=None):
+        if state not in self.STATES:
+            return
+        self._state     = state
+        self._frame_idx = 0
+        self._revert_to = revert_to or "playing"
+        if self._after_id:
+            self._parent.after_cancel(self._after_id)
+            self._after_id = None
+        self._animate()
+
+    def _animate(self):
+        frames = self.STATES[self._state]
+        face, arms = frames[self._frame_idx % len(frames)]
+        self._face_label.config(text=face)
+        self._arms_label.config(text=arms)
+        self._frame_idx += 1
+
+        if self._state in self.ONE_SHOT and self._frame_idx >= len(frames):
+            self._state     = self._revert_to
+            self._frame_idx = 0
+
+        interval  = self.INTERVALS.get(self._state, 400)
+        self._after_id = self._parent.after(interval, self._animate)
+
+
+# ── LLM banter system (subprocess-based) ─────────
+# The model loader and inference both run in a dedicated child process so
+# llama_cpp never touches the main process's GIL.  The main process sends
+# (event_key, context, history_snapshot) via _llm_req_q and receives
+# completed banter strings back via _llm_res_q.
+
+_llm_req_q: multiprocessing.Queue = None   # set up in PongGame.load_model
+_llm_res_q: multiprocessing.Queue = None
+
+current_banter = ""          # Updated in the main process by _poll_llm_responses
+banter_history = []          # Rolling history kept in the main process
 MAX_BANTER_HISTORY = 6
 
 SYSTEM_PROMPT = (
@@ -107,31 +268,38 @@ EVENTS = {
     "long_rally":      "There has been a long back and forth rally. React with excitement.",
 }
 
-def load_llm_background():
-    global llm, llm_loaded
+# ── Subprocess worker ─────────────────────────────
+def _llm_worker(models_cfg, req_q, res_q):
+    """Runs in a child process.  Loads the model then services requests forever.
+    Completely isolated GIL — tkinter in the parent process is unaffected."""
     try:
         from llama_cpp import Llama
         import psutil
-        import multiprocessing
 
-        ram_gb = psutil.virtual_memory().total / (1024**3)
+        try:
+            import os as _os
+            p = psutil.Process()
+            if hasattr(p, "nice"):
+                p.nice(10)
+        except Exception:
+            pass
 
-        # Pick the best model that actually exists on disk
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+
         chosen_path = None
         for tier in ["deep", "balanced", "fast"]:
-            path = MODELS[tier]["path"]
-            if os.path.exists(path) and ram_gb >= MODELS[tier]["ram_required"]:
+            path = models_cfg[tier]["path"]
+            if os.path.exists(path) and ram_gb >= models_cfg[tier]["ram_required"]:
                 chosen_path = path
-                break  # Stop at best viable tier
-
-        # Fallback — just use any model that exists
+                break
         if not chosen_path:
             for tier in ["fast", "balanced", "deep"]:
-                if os.path.exists(MODELS[tier]["path"]):
-                    chosen_path = MODELS[tier]["path"]
+                if os.path.exists(models_cfg[tier]["path"]):
+                    chosen_path = models_cfg[tier]["path"]
                     break
 
         if not chosen_path:
+            res_q.put(("status", "no_model"))
             return
 
         llm = Llama(
@@ -140,41 +308,36 @@ def load_llm_background():
             n_threads=max(1, multiprocessing.cpu_count() - 1),
             n_gpu_layers=0,
             n_batch=256,
-            verbose=False
+            verbose=False,
         )
-        llm_loaded = True
-    except Exception:
-        llm_loaded = False
+        res_q.put(("status", "ready"))
 
-def generate_banter(event_key, context=""):
-    if not llm_loaded or llm is None:
+    except Exception:
+        res_q.put(("status", "error"))
         return
-    # Use a dedicated gate lock to atomically check-and-set banter_generating
-    if not banter_gate.acquire(blocking=False):
-        return  # Another thread is already at the gate
-    already_running = banter_generating.is_set()
-    banter_generating.set()
-    banter_gate.release()
-    if already_running:
-        return  # LLM already running — drop this request
-    def _gen():
-        global current_banter, banter_history
-        if not llm_loaded or llm is None:
-            banter_generating.clear()
-            return
+
+    # Service loop
+    while True:
         try:
+            item = req_q.get()
+            if item is None:          # Sentinel — shut down
+                break
+            event_key, context, history_snapshot = item
+
             if event_key == "game_start":
                 base_prompt = random.choice(GAME_START_OPENERS)
             else:
-                base_prompt = EVENTS.get(event_key, "Something interesting just happened in the game. React briefly.")
+                base_prompt = EVENTS.get(
+                    event_key,
+                    "Something interesting just happened in the game. React briefly.",
+                )
             prompt = f"{base_prompt}{(' ' + context) if context else ''}"
-            # Build messages with rolling history so the model doesn't repeat itself
-            with banter_lock:
-                history_snapshot = list(banter_history)
+
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             for past in history_snapshot:
                 messages.append({"role": "assistant", "content": past})
             messages.append({"role": "user", "content": prompt})
+
             output = llm.create_chat_completion(
                 messages=messages,
                 max_tokens=60,
@@ -185,16 +348,23 @@ def generate_banter(event_key, context=""):
             )
             text = output["choices"][0]["message"]["content"].strip()
             text = text.strip('"').strip("'")
-            with banter_lock:
-                banter_history.append(text)
-                if len(banter_history) > MAX_BANTER_HISTORY:
-                    banter_history.pop(0)
-                current_banter = f"GRID: {text}"
+            res_q.put(("banter", text))
         except Exception:
-            pass
-        finally:
-            banter_generating.clear()
-    threading.Thread(target=_gen, daemon=True).start()
+            pass   # Never crash the worker; just skip this request
+
+
+def generate_banter(event_key, context=""):
+    """Send a banter request to the worker process (non-blocking, drops if busy)."""
+    if _llm_req_q is None:
+        return
+    # Drop if the queue already has a pending request — don't pile up
+    if not _llm_req_q.empty():
+        return
+    history_snapshot = list(banter_history)
+    try:
+        _llm_req_q.put_nowait((event_key, context, history_snapshot))
+    except Exception:
+        pass
 
 # ── Main game class ───────────────────────────────
 class PongGame:
@@ -208,6 +378,78 @@ class PongGame:
                                 highlightthickness=0)
         self.canvas.pack()
 
+        # ── Settings toolbar ──────────────────────────
+        # Sits between canvas and banter — always visible, greyed during play
+        self._difficulty    = DEFAULT_DIFFICULTY
+        self._ball_speed_key = DEFAULT_BALL_SPEED
+
+        toolbar = tk.Frame(root, bg=BG)
+        toolbar.pack(fill=tk.X, pady=(2, 0))
+
+        tk.Label(toolbar, text="DIFFICULTY:", bg=BG, fg=TEXT_DIM,
+                 font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(12, 2))
+
+        self._diff_btn = tk.Button(
+            toolbar, text=f"{self._difficulty} ▾",
+            bg=BG, fg=TEXT_BRIGHT,
+            activebackground="#001100", activeforeground=TEXT_BRIGHT,
+            font=("Courier New", 8, "bold"), relief="flat",
+            cursor="hand2", bd=0, padx=6,
+            command=self._open_diff_menu,
+        )
+        self._diff_btn.pack(side=tk.LEFT)
+        self._diff_btn.bind("<Enter>", lambda e: self._diff_btn.config(fg=TEXT_CYAN))
+        self._diff_btn.bind("<Leave>", lambda e: self._diff_btn.config(fg=TEXT_BRIGHT))
+
+        tk.Label(toolbar, text="  |  BALL:", bg=BG, fg=TEXT_DIM,
+                 font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(8, 2))
+
+        self._speed_btn = tk.Button(
+            toolbar, text=f"{self._ball_speed_key} ▾",
+            bg=BG, fg=TEXT_BRIGHT,
+            activebackground="#001100", activeforeground=TEXT_BRIGHT,
+            font=("Courier New", 8, "bold"), relief="flat",
+            cursor="hand2", bd=0, padx=6,
+            command=self._open_speed_menu,
+        )
+        self._speed_btn.pack(side=tk.LEFT)
+        self._speed_btn.bind("<Enter>", lambda e: self._speed_btn.config(fg=TEXT_CYAN))
+        self._speed_btn.bind("<Leave>", lambda e: self._speed_btn.config(fg=TEXT_BRIGHT))
+
+        tk.Label(toolbar, text="  (changes take effect next serve)",
+                 bg=BG, fg=TEXT_DIM,
+                 font=("Courier New", 7, "italic")).pack(side=tk.LEFT, padx=(4, 0))
+
+        # Spacer pushes pause/restart to the right
+        tk.Frame(toolbar, bg=BG).pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        self._pause_btn = tk.Button(
+            toolbar, text="⏸ PAUSE",
+            bg=BG, fg=TEXT_DIM,
+            activebackground="#001100", activeforeground=TEXT_ORANGE,
+            font=("Courier New", 8, "bold"), relief="flat",
+            cursor="hand2", bd=0, padx=8,
+            command=self.toggle_pause,
+        )
+        self._pause_btn.pack(side=tk.LEFT)
+        self._pause_btn.bind("<Enter>", lambda e: self._pause_btn.config(fg=TEXT_ORANGE))
+        self._pause_btn.bind("<Leave>", lambda e: self._pause_btn.config(fg=TEXT_DIM))
+
+        tk.Label(toolbar, text=" | ", bg=BG, fg=TEXT_DIM,
+                 font=("Courier New", 8)).pack(side=tk.LEFT)
+
+        self._restart_btn = tk.Button(
+            toolbar, text="↺ RESTART",
+            bg=BG, fg=TEXT_DIM,
+            activebackground="#001100", activeforeground="#ff4444",
+            font=("Courier New", 8, "bold"), relief="flat",
+            cursor="hand2", bd=0, padx=8,
+            command=self.restart_game,
+        )
+        self._restart_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._restart_btn.bind("<Enter>", lambda e: self._restart_btn.config(fg="#ff4444"))
+        self._restart_btn.bind("<Leave>", lambda e: self._restart_btn.config(fg=TEXT_DIM))
+
         # Banter label at bottom
         self.banter_var = tk.StringVar(value="")
         self.banter_label = tk.Label(
@@ -216,54 +458,144 @@ class PongGame:
             bg=BG,
             fg=BANTER_COLOR,
             font=("Courier New", 11, "italic"),
-            wraplength=860,
+            wraplength=760,
             justify="center",
-            height=2  # Fixed height — prevents long responses from pushing status label off screen
+            height=2
         )
-        self.banter_label.pack(pady=(0, 6))
+        self.banter_label.pack(pady=(0, 2))
+
+        # Avatar + status on the same row so avatar doesn't steal vertical space
+        bottom_row = tk.Frame(root, bg=BG)
+        bottom_row.pack(pady=(0, 4))
+
+        self.avatar = PongAvatar(bottom_row)
+        self.avatar.pack(side=tk.LEFT, padx=(0, 12))
 
         # Status label
         self.status_var = tk.StringVar(value="Loading GRID companion...")
         self.status_label = tk.Label(
-            root,
+            bottom_row,
             textvariable=self.status_var,
             bg=BG,
             fg=TEXT_DIM,
             font=("Courier New", 8),
         )
-        self.status_label.pack(pady=(0, 4))
+        self.status_label.pack(side=tk.LEFT)
 
         self.reset_game()
         self.draw_background()
 
-        # Key bindings
-        self.root.bind("<w>",      self.move_up)
-        self.root.bind("<s>",      self.move_down)
-        self.root.bind("<Up>",     self.move_up)
-        self.root.bind("<Down>",   self.move_down)
+        # Held-key tracking — stores which keys are currently pressed.
+        # This bypasses OS key-repeat delay entirely: the game loop reads
+        # _keys_held every frame and moves the paddle at a fixed speed.
+        self._keys_held = set()
+
+        self.root.bind("<w>",            lambda e: self._keys_held.add("up"))
+        self.root.bind("<KeyRelease-w>", lambda e: self._keys_held.discard("up"))
+        self.root.bind("<Up>",            lambda e: self._keys_held.add("up"))
+        self.root.bind("<KeyRelease-Up>", lambda e: self._keys_held.discard("up"))
+        self.root.bind("<s>",             lambda e: self._keys_held.add("down"))
+        self.root.bind("<KeyRelease-s>",  lambda e: self._keys_held.discard("down"))
+        self.root.bind("<Down>",             lambda e: self._keys_held.add("down"))
+        self.root.bind("<KeyRelease-Down>",  lambda e: self._keys_held.discard("down"))
+
         self.root.bind("<space>",  self.on_space)
         self.root.bind("<Escape>", lambda e: self.root.destroy())
+        self.root.bind("<p>",      lambda e: self.toggle_pause())
+        self.root.bind("<P>",      lambda e: self.toggle_pause())
         self.root.focus_set()
 
-        # Load LLM in background
-        threading.Thread(target=self.load_model, daemon=True).start()
+        self._paused = False
+        self._game_loop_id = None
+        self._poll_id = None
+
+        # Launch LLM worker subprocess (own GIL — can't freeze tkinter)
+        self._start_llm_subprocess()
 
         self.state       = "waiting"   # waiting / playing / scored / gameover
         self.rally_count = 0
         self.last_banter_event = ""
-        self._cached_banter = ""       # Banter snapshot refreshed once per second
-        self._banter_tick   = 0        # Frame counter for throttling banter reads
-
         self.show_start_screen()
         self.game_loop()
 
-    def load_model(self):
-        load_llm_background()
-        if llm_loaded:
-            self.root.after(0, lambda: self.status_var.set("GRID is online — Press SPACE to play"))
-            self.root.after(0, lambda: generate_banter("game_start"))
-        else:
-            self.root.after(0, lambda: self.status_var.set("GRID offline (no model found) — Press SPACE to play"))
+    def _start_llm_subprocess(self):
+        global _llm_req_q, _llm_res_q
+        _llm_req_q = multiprocessing.Queue(maxsize=1)
+        _llm_res_q = multiprocessing.Queue()
+        self._llm_proc = multiprocessing.Process(
+            target=_llm_worker,
+            args=(MODELS, _llm_req_q, _llm_res_q),
+            daemon=True,
+        )
+        self._llm_proc.start()
+        # Begin polling for status/banter messages from the worker
+        self._poll_llm_responses()
+
+    def _poll_llm_responses(self):
+        """Called every 200 ms via after().  Drains the response queue."""
+        global current_banter, banter_history
+        try:
+            while True:
+                kind, payload = _llm_res_q.get_nowait()
+                if kind == "status":
+                    if payload == "ready":
+                        self.status_var.set("GRID is online — Press SPACE to play")
+                        self.avatar.set_state("waiting")
+                        # Only greet if still on start screen — not mid-game
+                        if self.state == "waiting":
+                            generate_banter("game_start")
+                    elif payload == "no_model":
+                        self.status_var.set("GRID offline (no model found) — Press SPACE to play")
+                        self.avatar.set_state("idle")
+                    else:  # "error"
+                        self.status_var.set("GRID offline (load error) — Press SPACE to play")
+                        self.avatar.set_state("idle")
+                elif kind == "banter":
+                    banter_history.append(payload)
+                    if len(banter_history) > MAX_BANTER_HISTORY:
+                        banter_history.pop(0)
+                    current_banter = f"GRID: {payload}"
+                    self.banter_var.set("")
+                    self.banter_var.set(current_banter)
+        except Exception:
+            pass  # Queue empty or process not started yet
+        self._poll_id = self.root.after(200, self._poll_llm_responses)
+
+    def _open_diff_menu(self):
+        menu = tk.Menu(self.root, tearoff=0, bg="#001100", fg=TEXT_BRIGHT,
+                       activebackground="#002200", activeforeground=TEXT_CYAN,
+                       font=("Courier New", 9), bd=0, relief="flat")
+        for key in DIFFICULTIES:
+            marker = "  <" if key == self._difficulty else ""
+            menu.add_command(
+                label=f"  {key}{marker}",
+                command=lambda k=key: self._set_difficulty(k)
+            )
+        x = self._diff_btn.winfo_rootx()
+        y = self._diff_btn.winfo_rooty() + self._diff_btn.winfo_height()
+        menu.tk_popup(x, y)
+
+    def _set_difficulty(self, key):
+        self._difficulty = key
+        self._diff_btn.config(text=f"{key} ▾")
+
+    def _open_speed_menu(self):
+        menu = tk.Menu(self.root, tearoff=0, bg="#001100", fg=TEXT_BRIGHT,
+                       activebackground="#002200", activeforeground=TEXT_CYAN,
+                       font=("Courier New", 9), bd=0, relief="flat")
+        for key in BALL_SPEEDS:
+            marker = "  <" if key == self._ball_speed_key else ""
+            menu.add_command(
+                label=f"  {key}  ({BALL_SPEEDS[key]}){marker}",
+                command=lambda k=key: self._set_ball_speed(k)
+            )
+        x = self._speed_btn.winfo_rootx()
+        y = self._speed_btn.winfo_rooty() + self._speed_btn.winfo_height()
+        menu.tk_popup(x, y)
+
+    def _set_ball_speed(self, key):
+        self._ball_speed_key = key
+        self._speed_btn.config(text=f"{key} ▾")
 
     def reset_game(self):
         global banter_history, current_banter
@@ -272,8 +604,6 @@ class PongGame:
         self.player_score = 0
         self.ai_score     = 0
         self.last_banter_event = ""
-        self._cached_banter = ""
-        self._banter_tick   = 0
         banter_history = []  # Reset history each new game
         current_banter = ""
         self.reset_ball()
@@ -283,7 +613,8 @@ class PongGame:
         self.ball_y  = H // 2
         angle_y      = random.uniform(-3, 3)
         direction    = random.choice([-1, 1])
-        self.ball_vx = BALL_SPEED * direction
+        speed        = BALL_SPEEDS.get(self._ball_speed_key, BALL_SPEED)
+        self.ball_vx = speed * direction
         self.ball_vy = angle_y
         self.rally_count = 0
         self.last_banter_event = ""  # Allow long_rally banter to fire each new point
@@ -326,48 +657,121 @@ class PongGame:
             text="[ SPACE ] to start",
             font=("Courier New", 14, "bold"), fill=TEXT_ORANGE, tags="overlay")
         self.canvas.create_text(W//2, H - 20,
-            text="ESC to quit",
+            text="ESC to quit  |  P to pause",
             font=("Courier New", 9), fill=TEXT_DIM, tags="overlay")
+
+    def toggle_pause(self):
+        # Only allow pause during active play or while already paused
+        if self.state not in ("playing", "scored") and not self._paused:
+            return
+        self._paused = not self._paused
+        if self._paused:
+            self._pause_btn.config(text="▶ RESUME", fg=TEXT_ORANGE)
+            self._keys_held.clear()  # Drop held keys so paddle doesn't lurch on resume
+            self.canvas.delete("pause_overlay")
+            self.canvas.create_text(
+                W // 2, H // 2 - 20,
+                text="PAUSED",
+                font=("Courier New", 36, "bold"),
+                fill=TEXT_ORANGE,
+                tags="pause_overlay",
+            )
+            self.canvas.create_text(
+                W // 2, H // 2 + 30,
+                text="[ P ] to resume",
+                font=("Courier New", 12),
+                fill=TEXT_DIM,
+                tags="pause_overlay",
+            )
+        else:
+            self._pause_btn.config(text="⏸ PAUSE", fg=TEXT_DIM)
+            self.canvas.delete("pause_overlay")
+
+    def restart_game(self):
+        # Cancel any stale scheduled callbacks so we don't accumulate duplicate loops
+        if self._game_loop_id is not None:
+            self.root.after_cancel(self._game_loop_id)
+            self._game_loop_id = None
+        if self._poll_id is not None:
+            self.root.after_cancel(self._poll_id)
+            self._poll_id = None
+
+        # Drain the LLM response queue so stale banter/status doesn't replay
+        if _llm_res_q is not None:
+            try:
+                while True:
+                    _llm_res_q.get_nowait()
+            except Exception:
+                pass
+
+        self._paused = False
+        self._pause_btn.config(text="⏸ PAUSE", fg=TEXT_DIM)
+        self._keys_held.clear()
+        self.canvas.delete("pause_overlay")
+        self.reset_game()
+        self.canvas.delete("overlay")
+        self.state = "waiting"
+        self.show_start_screen()
+        self.banter_var.set("")
+        self.avatar.set_state("waiting")
+
+        # Restart both loops fresh
+        self._poll_id = self.root.after(200, self._poll_llm_responses)
+        self.game_loop()
 
     def on_space(self, event=None):
         if self.state == "waiting":
             self.canvas.delete("overlay")
             self.state = "playing"
+            self.avatar.set_state("playing")
         elif self.state == "scored":
             self.reset_ball()
             self.state = "playing"
+            self.avatar.set_state("playing")
         elif self.state == "gameover":
             self.reset_game()
             self.canvas.delete("overlay")
             self.state = "waiting"
             self.show_start_screen()
             self.banter_var.set("")
+            self.avatar.set_state("waiting")
 
-    def move_up(self, event=None):
-        if self.state == "playing":
-            self.player_y = max(0, self.player_y - 20)
-
-    def move_down(self, event=None):
-        if self.state == "playing":
-            self.player_y = min(H - PAD_H, self.player_y + 20)
+    def update_player(self):
+        if self.state != "playing":
+            return
+        if "up" in self._keys_held:
+            self.player_y = max(0, self.player_y - PLAYER_SPEED)
+        if "down" in self._keys_held:
+            self.player_y = min(H - PAD_H, self.player_y + PLAYER_SPEED)
 
     def update_ai(self):
-        # AI tracks ball with occasional intentional mistakes
-        if random.random() < AI_MISTAKE:
+        diff    = DIFFICULTIES.get(self._difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+        ai_spd  = diff["ai_speed"]
+        mistake = diff["ai_mistake"]
+        # AI tracks ball with intentional mistakes scaled by difficulty
+        if random.random() < mistake:
             return
         target = self.ball_y - PAD_H // 2
-        diff = target - self.ai_y
+        gap = target - self.ai_y
         # Dead zone — stop jittering when close enough
-        if abs(diff) < AI_SPEED:
+        if abs(gap) < ai_spd:
             return
-        if diff > 0:
-            self.ai_y = min(H - PAD_H, self.ai_y + AI_SPEED)
+        if gap > 0:
+            self.ai_y = min(H - PAD_H, self.ai_y + ai_spd)
         else:
-            self.ai_y = max(0, self.ai_y - AI_SPEED)
+            self.ai_y = max(0, self.ai_y - ai_spd)
 
     def update_ball(self):
         self.ball_x += self.ball_vx
         self.ball_y += self.ball_vy
+
+        # Avatar reacts when ball is coming toward GRID's side (right half, moving right)
+        if self.ball_vx > 0 and self.ball_x > W // 2:
+            if self.avatar._state not in ("ball_coming", "scored_ai", "scored_player",
+                                          "long_rally", "ai_wins", "player_wins"):
+                self.avatar.set_state("ball_coming", revert_to="playing")
+        elif self.ball_vx < 0 and self.avatar._state == "ball_coming":
+            self.avatar.set_state("playing")
 
         # Top/bottom bounce
         if self.ball_y <= 0:
@@ -421,22 +825,25 @@ class PongGame:
         diff = abs(ps - ai)
         score_ctx = f"Current score: you {ai} — friend {ps}."
 
-        # Check game-over first so we fire exactly one banter event per point.
-        # Previously the code fired a point-banter AND a gameover-banter in the
-        # same call, launching two concurrent LLM threads that raced to write
-        # current_banter — the slower one would silently overwrite the faster one.
         if ps >= SCORE_TO_WIN:
             self.state = "gameover"
             self.show_gameover("PLAYER")
+            self.avatar.set_state("player_wins", revert_to="idle")
             generate_banter("player_wins", f"Final score: you {ai} — friend {ps}.")
             return
         if ai >= SCORE_TO_WIN:
             self.state = "gameover"
             self.show_gameover("GRID")
+            self.avatar.set_state("ai_wins", revert_to="idle")
             generate_banter("ai_wins", f"Final score: you {ai} — friend {ps}.")
             return
 
-        # Only fire one banter event per point — close_game takes priority when tense
+        # React to the point with avatar then return to playing
+        if scorer == "player":
+            self.avatar.set_state("scored_player", revert_to="playing")
+        else:
+            self.avatar.set_state("scored_ai", revert_to="playing")
+
         if diff <= 1 and ps + ai > 4 and random.random() < 0.4:
             generate_banter("close_game", score_ctx)
         elif scorer == "player":
@@ -453,6 +860,7 @@ class PongGame:
     def check_rally_banter(self):
         if self.rally_count >= 8 and self.last_banter_event != "long_rally":
             self.last_banter_event = "long_rally"
+            self.avatar.set_state("long_rally", revert_to="playing")
             generate_banter("long_rally")
 
     def show_gameover(self, winner):
@@ -540,22 +948,15 @@ class PongGame:
                 text="[ SPACE ] to serve",
                 font=("Courier New", 13), fill=TEXT_ORANGE, tags="game")
 
-        # Refresh banter snapshot once per second (~60 frames) instead of every frame
-        self._banter_tick += 1
-        if self._banter_tick >= 60:
-            self._banter_tick = 0
-            with banter_lock:
-                self._cached_banter = current_banter
-        if self._cached_banter and self._cached_banter != self.banter_var.get():
-            self.banter_var.set("")  # Clear first to force label resize
-            self.banter_var.set(self._cached_banter)
+        # Banter is now updated directly by _poll_llm_responses — no per-frame check needed
 
     def game_loop(self):
-        if self.state == "playing":
+        if self.state == "playing" and not self._paused:
+            self.update_player()
             self.update_ai()
             self.update_ball()
         self.draw_frame()
-        self.root.after(16, self.game_loop)  # ~60fps
+        self._game_loop_id = self.root.after(16, self.game_loop)  # ~60fps
 
 
 # ── Entry point ───────────────────────────────────
@@ -578,4 +979,11 @@ def launch_pong():
     root.mainloop()
 
 if __name__ == "__main__":
+    # freeze_support() is a no-op on non-frozen builds but required for
+    # PyInstaller / py2app frozen executables on Windows & macOS.
+    multiprocessing.freeze_support()
+    # Force 'spawn' start method so the child process gets a clean Python
+    # interpreter without inheriting tkinter state (critical on macOS where
+    # the default is 'fork' and on Windows where it's already 'spawn').
+    multiprocessing.set_start_method("spawn", force=True)
     launch_pong()
