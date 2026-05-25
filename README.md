@@ -1,4 +1,4 @@
-# ⚡ NEURAL_GRID v1.0
+# ⚡ NEURAL_GRID v1.1
 
 > A portable, fully offline AI assistant that runs from a USB drive on any Windows PC.  
 > No internet. No cloud. No data collection. Just raw local inference.  
