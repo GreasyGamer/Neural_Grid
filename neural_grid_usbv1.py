@@ -25,8 +25,8 @@ except ImportError:
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION = "1.0.6"
-BUILD_DATE = "5-21-2026"
+VERSION = "1.1.6"
+BUILD_DATE = "5-25-2026"
 DEBUG = False  # Set to True to enable debug output in console
 
 # ────────────────────────────────────────────────
@@ -46,40 +46,137 @@ else:
     tts_speaker = None
     tts_available = False
 
-# Pre-compiled regex for speak_text (compiled once, reused every call)
+# Pre-compiled regex for TTS cleaning (compiled once, reused every call)
 _TTS_EMOJI_RE   = re.compile(r'[⚠📍🔧⚡📋✓✗←🔊🔇█░▓╔╗╚╝║═]')
 _TTS_TAG_RE     = re.compile(r'\[.*?\]')
 _TTS_DASH_RE    = re.compile(r'─+')
 _TTS_NEWLINE_RE = re.compile(r'\n+')
 
+# Punctuation that marks a good speak boundary
+_TTS_BREAK_RE   = re.compile(r'[.!?,;:\n]')
+
 # ────────────────────────────────────────────────
 # VOICE/TTS FUNCTIONS
 # ────────────────────────────────────────────────
+
+# Streaming TTS state — a dedicated worker thread drains a queue of phrase
+# chunks so SAPI speaks each one as soon as it arrives without blocking the
+# UI or the inference thread.
+_tts_chunk_queue: Queue = Queue()
+_tts_worker_started = False
+
+def _tts_worker():
+    """Background thread: pulls phrase chunks off the queue and speaks them
+    one at a time via SAPI.  Runs for the lifetime of the process.
+    
+    IMPORTANT: COM objects (like SAPI SpVoice) are apartment-threaded and
+    cannot be shared across threads. We create a fresh SpVoice instance here
+    on the worker thread after calling CoInitialize, so SAPI always runs in
+    the correct COM apartment."""
+    if not _WIN32COM_AVAILABLE:
+        return
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception as e:
+        if DEBUG:
+            print(f"[TTS Worker] CoInitialize failed: {e}")
+        return
+
+    try:
+        import win32com.client as _wc
+        worker_speaker = _wc.Dispatch("SAPI.SpVoice")
+        worker_speaker.Rate = tts_speaker.Rate if tts_speaker else 1
+        worker_speaker.Volume = 100
+    except Exception as e:
+        if DEBUG:
+            print(f"[TTS Worker] Failed to create SpVoice: {e}")
+        return
+
+    while True:
+        chunk = _tts_chunk_queue.get()   # blocks until something arrives
+        if chunk is None:                # None = shutdown sentinel
+            break
+        try:
+            worker_speaker.Speak(chunk)  # synchronous — waits until done
+        except Exception as e:
+            if DEBUG:
+                print(f"[TTS Worker Error] {e}")
+
+def _ensure_tts_worker():
+    global _tts_worker_started
+    if not _tts_worker_started and tts_available:
+        t = threading.Thread(target=_tts_worker, daemon=True)
+        t.start()
+        _tts_worker_started = True
+
+def _clean_for_tts(text: str) -> str:
+    """Strip UI-only characters so SAPI doesn't read them aloud."""
+    text = _TTS_EMOJI_RE.sub('', text)
+    text = _TTS_TAG_RE.sub('', text)
+    text = _TTS_DASH_RE.sub('', text)
+    text = _TTS_NEWLINE_RE.sub('. ', text)
+    return text.strip()
+
 def stop_speaking():
+    """Flush the chunk queue and interrupt SAPI immediately."""
+    # Drain pending chunks so the worker doesn't keep speaking after stop
+    while not _tts_chunk_queue.empty():
+        try:
+            _tts_chunk_queue.get_nowait()
+        except Exception:
+            break
     if tts_available and tts_speaker:
         try:
-            tts_speaker.Speak("", 3)  # Flag 3 = PURGE + ASYNC to stop immediately
+            tts_speaker.Speak("", 3)  # Flag 3 = PURGE + ASYNC
         except Exception:
             pass
 
+# ── Streaming TTS state ──────────────────────────────────────────────────────
+# As tokens arrive we accumulate them here and flush on punctuation boundaries.
+_tts_buffer: str = ""
+
+def tts_feed_token(token: str):
+    """Call this for every streamed token when voice is enabled.
+    Flushes a chunk to the TTS worker whenever a sentence/phrase boundary
+    is detected so speech starts with the first sentence, not after the full
+    response is complete."""
+    global _tts_buffer
+    if not voice_enabled or not tts_available:
+        return
+    _ensure_tts_worker()
+    _tts_buffer += token
+    # Flush on punctuation boundaries so chunks are natural phrase lengths
+    if _TTS_BREAK_RE.search(token):
+        chunk = _clean_for_tts(_tts_buffer)
+        _tts_buffer = ""
+        if chunk and len(chunk) > 2:
+            if DEBUG:
+                print(f"[TTS chunk] '{chunk[:60]}'")
+            _tts_chunk_queue.put(chunk)
+
+def tts_flush():
+    """Flush any remaining buffered text at the end of a response."""
+    global _tts_buffer
+    if _tts_buffer:
+        chunk = _clean_for_tts(_tts_buffer)
+        _tts_buffer = ""
+        if chunk and len(chunk) > 2:
+            if DEBUG:
+                print(f"[TTS flush] '{chunk[:60]}'")
+            _tts_chunk_queue.put(chunk)
+
 def speak_text(text):
+    """Speak a complete text string at once (used for non-streaming TTS,
+    e.g. voice-toggle confirmation messages)."""
     if not voice_enabled or not tts_available or not tts_speaker:
         return
-    try:
-        stop_speaking()
-        clean_text = _TTS_EMOJI_RE.sub('', text)
-        clean_text = _TTS_TAG_RE.sub('', clean_text)
-        clean_text = _TTS_DASH_RE.sub('', clean_text)
-        clean_text = _TTS_NEWLINE_RE.sub('. ', clean_text).strip()
+    _ensure_tts_worker()
+    clean = _clean_for_tts(text)
+    if clean and len(clean) > 3:
         if DEBUG:
-            print(f"[DEBUG] Speaking: '{clean_text[:100]}'")
-        if clean_text and len(clean_text) > 3:
-            tts_speaker.Speak(clean_text)
-            if DEBUG:
-                print("[DEBUG] Speech completed")
-    except Exception as e:
-        if DEBUG:
-            print(f"[TTS Error] {e}")
+            print(f"[DEBUG] speak_text: '{clean[:100]}'")
+        _tts_chunk_queue.put(clean)
 
 # ────────────────────────────────────────────────
 # PATHS & CONFIGURATION
@@ -230,6 +327,147 @@ THEMES = {
 
 current_theme = "green"
 
+# ────────────────────────────────────────────────
+# AVATAR WIDGET
+# ────────────────────────────────────────────────
+class AvatarWidget:
+    """ASCII avatar that reacts to app state: idle, typing, thinking, loading, done."""
+
+    # Each state has a list of (face, arms) tuples that cycle as animation frames.
+    # Use raw strings (r"...") to avoid backslash escape issues.
+    STATES = {
+        "loading": [
+            (r"( ... )",  r" |   | "),
+            (r"( >.. )",  r" /   | "),
+            (r"( >>. )",  r" /   \ "),
+            (r"( >>> )",  r" |   | "),
+            (r"( .>> )",  r" \   | "),
+            (r"( ..> )",  r" \   / "),
+        ],
+        "thinking": [
+            (r"( o_? )",  r" /     "),
+            (r"( o_. )",  r" |     "),
+            (r"( o_? )",  r" /     "),
+            (r"( -_. )",  r" |     "),
+        ],
+        "typing": [
+            (r"( ^_^ )",  r" |   _/"),
+            (r"( ^_^ )",  r" |  _/ "),
+            (r"( ^_^ )",  r" |   _/"),
+            (r"( ~_^ )",  r" |  _/ "),
+        ],
+        "idle": [
+            (r"( -_- )",  r" |   | "),
+            (r"( -_- )",  r" |   | "),
+            (r"( -_- )",  r" |   | "),
+            (r"( ._. )",  r" |   | "),
+        ],
+        "wave": [
+            (r"( ^o^ )",  r"o/     "),
+            (r"( ^o^ )",  r" /     "),
+            (r"( ^o^ )",  r"o/     "),
+            (r"( ^o^ )",  r" /     "),
+            (r"( ^o^ )",  r"o/     "),
+            (r"( ^o^ )",  r" |     "),
+            (r"( ^o^ )",  r" |     "),
+        ],
+        "done": [
+            (r"( ^_^ )",  r" \   / "),
+            (r"( ^_^ )",  r" |   | "),
+            (r"( ^_^ )",  r" \   / "),
+            (r"( ^_^ )",  r" |   | "),
+        ],
+        "error": [
+            (r"( >_< )",  r" \   / "),
+            (r"( x_x )",  r" |   | "),
+        ],
+    }
+
+    # How fast to cycle frames per state (ms)
+    INTERVALS = {
+        "loading":  120,
+        "thinking": 400,
+        "typing":   200,
+        "idle":     900,
+        "wave":     160,
+        "done":     300,
+        "error":    500,
+    }
+
+    # After these one-shot states finish, revert to idle
+    ONE_SHOT = {"wave", "done", "error"}
+
+    def __init__(self, parent):
+        self._state = "loading"
+        self._frame_idx = 0
+        self._after_id = None
+        self._parent = parent
+
+        # Outer container — tight padding so it doesn't eat much space
+        self._frame = tk.Frame(parent, bg="#0a0a0a")
+
+        self._face_label = tk.Label(
+            self._frame,
+            text="",
+            font=("Courier New", 9, "bold"),
+            bg="#0a0a0a",
+            fg="#00ff41",
+            anchor="center",
+            width=10,
+        )
+        self._face_label.pack()
+
+        self._arms_label = tk.Label(
+            self._frame,
+            text="",
+            font=("Courier New", 8),
+            bg="#0a0a0a",
+            fg="#00ff41",
+            anchor="center",
+            width=10,
+        )
+        self._arms_label.pack()
+
+        self._animate()
+
+    def pack(self, **kwargs):
+        self._frame.pack(**kwargs)
+
+    def set_state(self, state):
+        if state not in self.STATES:
+            return
+        if self._state == state:
+            return
+        self._state = state
+        self._frame_idx = 0
+        # Cancel pending callback and restart immediately for snappy response
+        if self._after_id:
+            self._parent.after_cancel(self._after_id)
+            self._after_id = None
+        self._animate()
+
+    def update_colors(self, fg, bg):
+        self._face_label.config(fg=fg, bg=bg)
+        self._arms_label.config(fg=fg, bg=bg)
+        self._frame.config(bg=bg)
+
+    def _animate(self):
+        frames = self.STATES[self._state]
+        face, arms = frames[self._frame_idx % len(frames)]
+        self._face_label.config(text=face)
+        self._arms_label.config(text=arms)
+
+        self._frame_idx += 1
+
+        # One-shot states return to idle after one full cycle
+        if self._state in self.ONE_SHOT and self._frame_idx >= len(frames):
+            self._state = "idle"
+            self._frame_idx = 0
+
+        interval = self.INTERVALS.get(self._state, 500)
+        self._after_id = self._parent.after(interval, self._animate)
+
+
 def apply_theme(theme_name):
     global current_theme
     if theme_name not in THEMES:
@@ -245,6 +483,17 @@ def apply_theme(theme_name):
     # Header and status bar
     header.configure(bg=t["bg_header"], fg=t["fg_main"])
     status_bar.configure(bg=t["bg_header"], fg=t["fg_status"])
+
+    # Font toolbar
+    toolbar.configure(bg=t["bg_header"])
+    font_btn.configure(
+        bg=t["bg_header"],
+        fg=t["fg_status"],
+        activebackground=t["bg_input"],
+        activeforeground=t["fg_main"],
+    )
+    font_btn.bind("<Enter>", lambda e: font_btn.config(fg=t["fg_main"]))
+    font_btn.bind("<Leave>", lambda e: font_btn.config(fg=t["fg_status"]))
 
     # Chat box
     chat_box.configure(
@@ -280,6 +529,10 @@ def apply_theme(theme_name):
     # Refresh header so its label color/content reflects the new theme
     update_header()
 
+    # Update avatar colors to match new theme
+    if avatar is not None:
+        avatar.update_colors(t["fg_ai"], t["bg_dark"])
+
     # Redraw scanlines with new color
     draw_scanlines_themed(t["bg_scanline"])
     return True
@@ -310,6 +563,7 @@ current_mode = "normal"
 messages = []
 llm = None  # Global LLM instance; declared here so load_model_async can reference it
 response_queue = Queue()
+avatar = None  # Initialized after UI is built
 # Use threading.Event instead of bare booleans — gives correct cross-thread
 # visibility without relying on CPython GIL behaviour.
 _is_generating  = threading.Event()   # set = generating, clear = idle
@@ -450,6 +704,8 @@ def load_model_async(tier):
         ctx_size = MODELS[tier].get("ctx", 8192)
         
         update_status(f"[*] Loading {MODELS[tier]['name']}... (30-90 sec)")
+        if avatar is not None:
+            root.after(0, lambda: avatar.set_state("loading"))
         
         llm = Llama(
             model_path=MODELS[tier]["path"],
@@ -466,6 +722,8 @@ def load_model_async(tier):
         update_status(f"[+] {MODELS[tier]['name']} online.")
         enable_input()
         update_header()
+        if avatar is not None:
+            root.after(0, lambda: avatar.set_state("idle"))
         
     except Exception as e:
         model_loaded = False
@@ -528,6 +786,13 @@ def check_spelling(event=None):
     if text == _last_spell_text:
         return
     _last_spell_text = text
+
+    # Avatar reacts to typing — only when model is idle (not generating)
+    if avatar is not None and not _is_generating.is_set():
+        if text:
+            avatar.set_state("typing")
+        else:
+            avatar.set_state("idle")
 
     if not text or text.startswith("/") or not model_loaded:
         hide_suggestions()
@@ -970,6 +1235,9 @@ def check_response_queue():
                 chat_box.insert(tk.END, data, "ai_text")
                 chat_box.see(tk.END)
                 chat_box.config(state=tk.DISABLED)
+                # Feed each token to TTS as it arrives for true streaming speech
+                if voice_enabled:
+                    tts_feed_token(data)
 
             elif status == "stream_end":
                 chat_box.config(state=tk.NORMAL)
@@ -980,8 +1248,9 @@ def check_response_queue():
                     enable_input()
                     input_reenabled = True
                 update_header()
+                # Flush any remaining buffered tokens that didn't end on punctuation
                 if voice_enabled:
-                    threading.Thread(target=speak_text, args=(data,), daemon=True).start()
+                    tts_flush()
                 # Don't return — drain any remaining queued system messages
 
             elif status == "system":
@@ -1001,6 +1270,8 @@ def check_response_queue():
                 chat_box.insert(tk.END, "─" * 80 + "\n", "divider_tag")
                 chat_box.see(tk.END)
                 chat_box.config(state=tk.DISABLED)
+                if avatar is not None:
+                    avatar.set_state("error")
                 if not input_reenabled:
                     enable_input()
                     input_reenabled = True
@@ -1026,6 +1297,7 @@ def send_prompt(event=None):
     # If generating, treat Enter/Send as stop
     if _is_generating.is_set():
         _stop_generation.set()
+        stop_speaking()
         return
 
     hide_suggestions()
@@ -1075,12 +1347,16 @@ def disable_input():
     t = THEMES[current_theme]
     input_box.config(state=tk.DISABLED, bg=t["bg_input_dis"])
     send_btn.config(text="■ STOP", bg=_STOP_BG, fg=_STOP_FG)
+    if avatar is not None:
+        avatar.set_state("thinking")
 
 def enable_input():
     t = THEMES[current_theme]
     input_box.config(state=tk.NORMAL, bg=t["bg_input"])
     send_btn.config(text="SEND ▶", bg=t["bg_btn"], fg=t["fg_main"])
     input_box.focus()
+    if avatar is not None:
+        avatar.set_state("done")
 
 # ────────────────────────────────────────────────
 # UI UPDATES
@@ -1190,6 +1466,73 @@ header = tk.Label(
 )
 header.pack(fill=tk.X)
 
+# ────────────────────────────────────────────────
+# FONT SIZE TOOLBAR
+# ────────────────────────────────────────────────
+FONT_SIZES       = [8, 9, 10, 11, 12, 13, 14, 16, 18]
+DEFAULT_FONT     = 11
+current_font_size = DEFAULT_FONT
+
+def apply_font_size(size):
+    """Update chat box, tag fonts, and input box to the chosen size."""
+    global current_font_size
+    current_font_size = size
+    chat_box.config(font=("Courier New", size))
+    chat_box.tag_config("user_tag",  font=("Courier New", size, "bold"))
+    chat_box.tag_config("ai_tag",    font=("Courier New", size, "bold"))
+    # Regular tags don't need explicit font — they inherit from chat_box
+    input_box.config(font=("Courier New", max(10, size - 1)))
+    font_btn.config(text=f"FONT: {size} ▾")
+
+def _open_font_menu():
+    """Build and post a tearoff-free font size menu under the toolbar button."""
+    t = THEMES[current_theme]
+    menu = tk.Menu(
+        root,
+        tearoff=0,
+        bg=t["bg_btn"],
+        fg=t["fg_main"],
+        activebackground=t["bg_btn_hover"],
+        activeforeground=t["fg_ai"],
+        font=("Courier New", 9),
+        bd=0,
+        relief="flat",
+    )
+    for sz in FONT_SIZES:
+        label = f"  {sz}  {'<' if sz == current_font_size else ''}"
+        menu.add_command(
+            label=label,
+            command=lambda s=sz: apply_font_size(s)
+        )
+    # Post directly below the button
+    x = font_btn.winfo_rootx()
+    y = font_btn.winfo_rooty() + font_btn.winfo_height()
+    menu.tk_popup(x, y)
+
+# Slim toolbar frame
+toolbar = tk.Frame(root, bg="#001100", height=22)
+toolbar.pack(fill=tk.X)
+toolbar.pack_propagate(False)
+
+font_btn = tk.Button(
+    toolbar,
+    text=f"FONT: {DEFAULT_FONT} ▾",
+    bg="#001100",
+    fg="#005500",
+    activebackground="#002200",
+    activeforeground="#00ff41",
+    font=("Courier New", 8, "bold"),
+    relief="flat",
+    cursor="hand2",
+    bd=0,
+    padx=8,
+    pady=0,
+    command=_open_font_menu,
+)
+font_btn.pack(side=tk.LEFT, pady=1)
+font_btn.bind("<Enter>", lambda e: font_btn.config(fg="#00ff41"))
+font_btn.bind("<Leave>", lambda e: font_btn.config(fg="#005500"))
+
 chat_box = scrolledtext.ScrolledText(
     root,
     bg="#000000",
@@ -1204,7 +1547,6 @@ chat_box = scrolledtext.ScrolledText(
     highlightcolor="#00aa33",
     bd=0
 )
-chat_box.pack(expand=True, fill=tk.BOTH, padx=12, pady=(4, 0))
 
 chat_box.tag_config("user_tag", foreground="#00ffff", font=("Courier New", 11, "bold"))
 chat_box.tag_config("user_text", foreground="#ffff99")
@@ -1213,8 +1555,21 @@ chat_box.tag_config("ai_text", foreground="#39ff14")
 chat_box.tag_config("command_tag", foreground="#ff9933")
 chat_box.tag_config("divider_tag", foreground="#004400")
 
+# ── Status bar — pack BOTTOM first so it always gets its space ──────────────
+status_bar = tk.Label(
+    root,
+    text=f"USB: {BASE_DIR}  |  Models: {MODELS_DIR}  |  Logs: {CHAT_LOGS_DIR}  |  /help for commands",
+    bg="#001100",
+    fg="#005500",
+    font=("Courier New", 8),
+    anchor="w",
+    padx=10
+)
+status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+# ── Input frame — pack BOTTOM second so it always sits above status bar ──────
 input_frame = tk.Frame(root, bg="#0a0a0a", bd=2, relief="flat")
-input_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+input_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=12, pady=(0, 12))
 
 prompt_label = tk.Label(
     input_frame,
@@ -1259,17 +1614,12 @@ send_btn.pack(side=tk.LEFT)
 send_btn.bind("<Enter>", lambda e: send_btn.config(bg="#004400") if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#440000"))
 send_btn.bind("<Leave>", lambda e: send_btn.config(bg="#003300") if send_btn.cget("text") == "SEND ▶" else send_btn.config(bg="#330000"))
 
-# Status bar at very bottom
-status_bar = tk.Label(
-    root,
-    text=f"USB: {BASE_DIR}  |  Models: {MODELS_DIR}  |  Logs: {CHAT_LOGS_DIR}  |  /help for commands",
-    bg="#001100",
-    fg="#005500",
-    font=("Courier New", 8),
-    anchor="w",
-    padx=10
-)
-status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+# Avatar — lives at the right end of the input bar
+avatar = AvatarWidget(input_frame)
+avatar.pack(side=tk.LEFT, padx=(8, 0))
+
+# ── Chat box — pack last so it only fills whatever space remains ─────────────
+chat_box.pack(expand=True, fill=tk.BOTH, padx=12, pady=(4, 0))
 
 # ────────────────────────────────────────────────
 # STARTUP
@@ -1281,6 +1631,10 @@ def startup_sequence():
     chat_box.insert(tk.END, f"[*] USB: {BASE_DIR}\n")
     chat_box.insert(tk.END, f"[*] Models: {MODELS_DIR}\n")
     chat_box.insert(tk.END, f"[*] Logs: {CHAT_LOGS_DIR}\n\n")
+
+    # Avatar waves hello on startup
+    if avatar is not None:
+        avatar.set_state("wave")
     
     recommended_tier, reason, ram_gb, cpu_count = recommend_model()
     
